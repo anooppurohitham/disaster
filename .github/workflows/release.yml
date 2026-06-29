@@ -1,0 +1,127 @@
+name: Release Disaster
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      release_base_url: ${{ steps.meta.outputs.release_base_url }}
+      updater_endpoint: ${{ steps.meta.outputs.updater_endpoint }}
+    steps:
+      - id: meta
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release_base_url=https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}" >> "$GITHUB_OUTPUT"
+          echo "updater_endpoint=https://${GITHUB_REPOSITORY_OWNER}.github.io/${repo_name}/updates/latest.json" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows
+            runner_arch: x64
+          - os: macos-latest
+            label: macos
+            runner_arch: arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_BASE_URL: ${{ needs.prepare.outputs.release_base_url }}
+      DISASTER_UPDATER_ENDPOINTS: ${{ needs.prepare.outputs.updater_endpoint }}
+      DISASTER_UPDATER_PUBKEY: ${{ secrets.TAURI_SIGNING_PUBLIC_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Sync release version
+        run: node scripts/set-version.mjs "$env:RELEASE_VERSION"
+        shell: powershell
+
+      - name: Build Tauri bundles
+        run: npm run tauri build
+
+      - name: Build updater manifest fragment
+        run: >
+          node scripts/build-updater-manifest.mjs
+          --bundle-dir src-tauri/target/release/bundle
+          --version "$env:RELEASE_VERSION"
+          --release-base-url "$env:RELEASE_BASE_URL"
+          --default-arch "${{ matrix.runner_arch }}"
+          --out "release-manifest/${{ matrix.label }}.json"
+        shell: powershell
+
+      - name: Upload updater manifest fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: updater-fragment-${{ matrix.label }}
+          path: release-manifest/${{ matrix.label }}.json
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Disaster ${{ env.RELEASE_VERSION }}
+          files: |
+            src-tauri/target/release/bundle/**/*
+
+  publish-updater-manifest:
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: updater-fragment-*
+          path: updater-fragments
+          merge-multiple: true
+
+      - name: Merge updater manifests
+        run: >
+          node scripts/merge-updater-manifests.mjs
+          --input-dir updater-fragments
+          --version "${{ needs.prepare.outputs.version }}"
+          --out dist-pages/updates/latest.json
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist-pages
+
+      - uses: actions/deploy-pages@v4
