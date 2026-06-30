@@ -1590,7 +1590,11 @@ function clearFixture(fixture: PatchedFixture) {
                 <small>UPDATE STATUS</small>
                 <h2>Updater</h2>
               </div>
-              <button onClick={() => void checkForUpdates(true)} disabled={checkingForUpdates}>
+              <button
+                className="appInfoActionButton"
+                onClick={() => void checkForUpdates(true)}
+                disabled={checkingForUpdates}
+              >
                 {checkingForUpdates ? "Checking..." : "Check now"}
               </button>
             </div>

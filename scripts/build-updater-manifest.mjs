@@ -81,7 +81,7 @@ function inferTarget(filePath) {
   }
 
   if (normalized.endsWith(".msi.zip") || normalized.endsWith(".msi")) {
-    return `windows-${arch}-msi`;
+    return `windows-${arch}`;
   }
 
   if (
@@ -89,7 +89,7 @@ function inferTarget(filePath) {
     normalized.endsWith("-setup.exe") ||
     normalized.endsWith(".nsis.zip")
   ) {
-    return `windows-${arch}-nsis`;
+    return `windows-${arch}`;
   }
 
   return null;
@@ -103,6 +103,15 @@ if (!fs.existsSync(bundleDir)) {
 const allFiles = walk(bundleDir);
 const platforms = {};
 
+function isWindowsNsisArtifact(filePath) {
+  const normalized = path.basename(filePath).toLowerCase();
+  return (
+    normalized.endsWith(".exe.zip") ||
+    normalized.endsWith("-setup.exe") ||
+    normalized.endsWith(".nsis.zip")
+  );
+}
+
 for (const signaturePath of allFiles.filter((file) => file.endsWith(".sig"))) {
   const assetPath = signaturePath.slice(0, -4);
   if (!fs.existsSync(assetPath)) continue;
@@ -111,8 +120,12 @@ for (const signaturePath of allFiles.filter((file) => file.endsWith(".sig"))) {
   if (!target) continue;
 
   if (platforms[target]) {
-    console.error(`Duplicate updater target detected for ${target}.`);
-    process.exit(1);
+    if (target.startsWith("windows-")) {
+      if (!isWindowsNsisArtifact(assetPath)) continue;
+    } else {
+      console.error(`Duplicate updater target detected for ${target}.`);
+      process.exit(1);
+    }
   }
 
   const fileName = path.basename(assetPath);

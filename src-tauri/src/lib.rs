@@ -7,7 +7,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
-use tauri::{Manager, State, Url};
+use tauri::{Manager, State};
 #[cfg(desktop)]
 use tauri::AppHandle;
 #[cfg(desktop)]
@@ -164,68 +164,13 @@ fn blackout(state: State<'_, DmxState>) -> Result<(), String> {
 }
 
 #[cfg(desktop)]
-fn get_updater_pubkey() -> Result<String, String> {
-    let value = option_env!("DISASTER_UPDATER_PUBKEY")
-        .map(str::to_string)
-        .or_else(|| std::env::var("DISASTER_UPDATER_PUBKEY").ok())
-        .ok_or_else(|| {
-            "Auto-update is not configured. Set DISASTER_UPDATER_PUBKEY before building Disaster."
-                .to_string()
-        })?;
-
-    let trimmed = value.trim().to_string();
-
-    if trimmed.is_empty() {
-        return Err(
-            "Auto-update is not configured. DISASTER_UPDATER_PUBKEY is empty.".to_string(),
-        );
-    }
-
-    Ok(trimmed)
-}
-
-#[cfg(desktop)]
-fn get_updater_endpoints() -> Result<Vec<Url>, String> {
-    let value = option_env!("DISASTER_UPDATER_ENDPOINTS")
-        .map(str::to_string)
-        .or_else(|| std::env::var("DISASTER_UPDATER_ENDPOINTS").ok())
-        .ok_or_else(|| {
-            "Auto-update is not configured. Set DISASTER_UPDATER_ENDPOINTS before building Disaster.".to_string()
-        })?;
-
-    let endpoints = value
-        .split(['\n', ',', ';'])
-        .map(str::trim)
-        .filter(|endpoint| !endpoint.is_empty())
-        .map(|endpoint| Url::parse(endpoint).map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("Invalid DISASTER_UPDATER_ENDPOINTS URL: {error}"))?;
-
-    if endpoints.is_empty() {
-        return Err(
-            "Auto-update is not configured. DISASTER_UPDATER_ENDPOINTS does not contain any URLs."
-                .to_string(),
-        );
-    }
-
-    Ok(endpoints)
-}
-
-#[cfg(desktop)]
 #[tauri::command]
 async fn check_for_updates(
     app: AppHandle,
     pending_update: State<'_, PendingUpdateState>,
 ) -> Result<Option<UpdateCheckResult>, String> {
-    let pubkey = get_updater_pubkey()?;
-    let endpoints = get_updater_endpoints()?;
-
     let update = app
-        .updater_builder()
-        .pubkey(pubkey)
-        .endpoints(endpoints)
-        .map_err(|e| e.to_string())?
-        .build()
+        .updater()
         .map_err(|e| e.to_string())?
         .check()
         .await
