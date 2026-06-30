@@ -92,19 +92,54 @@ jobs:
           name: updater-fragment-${{ matrix.label }}
           path: release-manifest/${{ matrix.label }}.json
 
-      - name: Publish GitHub release assets
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.label }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.app.tar.gz
+            src-tauri/target/release/bundle/**/*.app.tar.gz.sig
+            src-tauri/target/release/bundle/**/*-setup.exe
+            src-tauri/target/release/bundle/**/*-setup.exe.sig
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.msi.sig
+
+  publish-release:
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: Disaster ${{ env.RELEASE_VERSION }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Disaster ${{ needs.prepare.outputs.version }}
           body_path: RELEASE_NOTES.md
           files: |
-            src-tauri/target/release/bundle/**/*
+            release-assets/**/*.dmg
+            release-assets/**/*.app.tar.gz
+            release-assets/**/*.app.tar.gz.sig
+            release-assets/**/*-setup.exe
+            release-assets/**/*-setup.exe.sig
+            release-assets/**/*.msi
+            release-assets/**/*.msi.sig
 
   publish-updater-manifest:
     needs:
       - prepare
       - build
+      - publish-release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

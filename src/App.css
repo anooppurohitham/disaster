@@ -3365,7 +3365,7 @@ select {
 
 .universeGrid {
   display: grid;
-  grid-template-columns: repeat(32, minmax(20px, 1fr));
+  grid-template-columns: repeat(24, minmax(30px, 1fr));
   overflow-x: auto;
   gap: 3px;
   padding: 9px;
@@ -3375,8 +3375,8 @@ select {
 
 .universeGrid button {
   display: grid;
-  min-width: 20px;
-  height: 32px;
+  min-width: 30px;
+  height: 40px;
   padding: 0;
   place-content: center;
   gap: 1px;
@@ -3384,18 +3384,18 @@ select {
   background: #242931;
   border: 1px solid #303741;
   border-radius: 3px;
-  font-size: 7px;
+  font-size: 9px;
 }
 
 .universeGrid .channelValue {
   color: #dce5ef;
-  font-size: 8px;
+  font-size: 10px;
   line-height: 1;
 }
 
 .universeGrid .channelAddress {
   color: #697483;
-  font-size: 6px;
+  font-size: 8px;
   line-height: 1;
 }
 

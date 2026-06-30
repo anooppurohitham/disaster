@@ -222,6 +222,7 @@ function parseCueCommand(
     right: /\bright\b/.test(normalized),
     front: /\bfront\b/.test(normalized),
     back: /\b(back|rear)\b/.test(normalized),
+    center: /\b(center|centre|middle)\b/.test(normalized),
   };
   const hasSpatialTarget = Object.values(spatialWords).some(Boolean);
   const placementByFixtureId = new Map(
@@ -239,9 +240,21 @@ function parseCueCommand(
       if (!placement) return false;
       if (spatialWords.left && !spatialWords.right && placement.x >= 0.5) return false;
       if (spatialWords.right && !spatialWords.left && placement.x < 0.5) return false;
-      // The bottom of the 2D plot is the front/audience edge of the stage.
-      if (spatialWords.front && !spatialWords.back && placement.y < 0.5) return false;
-      if (spatialWords.back && !spatialWords.front && placement.y >= 0.5) return false;
+      if (
+        spatialWords.center &&
+        !spatialWords.left &&
+        !spatialWords.right &&
+        (placement.x < 1 / 3 || placement.x > 2 / 3)
+      ) return false;
+      // Stage View orientation: the top is front and the bottom is back.
+      if (spatialWords.front && !spatialWords.back && placement.y >= 0.5) return false;
+      if (spatialWords.back && !spatialWords.front && placement.y < 0.5) return false;
+      if (
+        spatialWords.center &&
+        !spatialWords.front &&
+        !spatialWords.back &&
+        (placement.y < 1 / 3 || placement.y > 2 / 3)
+      ) return false;
       return true;
     });
     targetLabel = [
@@ -249,6 +262,7 @@ function parseCueCommand(
       spatialWords.back ? "back" : "",
       spatialWords.left ? "left" : "",
       spatialWords.right ? "right" : "",
+      spatialWords.center ? "center" : "",
       "fixtures",
     ].filter(Boolean).join(" ");
     if (!targets.length) {
@@ -1284,7 +1298,12 @@ export default function TimelineEditor({
                   toColor: command.transitionToColor,
                 },
               ]
-            : track.colorTransitions;
+            : command.color
+              ? track.colorTransitions.filter(
+                  (transition) =>
+                    !overlapsRegion(transition.start, transition.duration),
+                )
+              : track.colorTransitions;
         const strobes = command.strobe !== null
           ? [
               ...track.strobes.filter((clip) => !overlapsRegion(clip.start, clip.duration)),
