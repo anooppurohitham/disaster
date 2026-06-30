@@ -1,4 +1,4 @@
 ## Recent changes
 
-- Open the application in a maximized window.
-- Edit a color transition’s duration by clicking its transition bubble.
+- Made update checks read-only until the user explicitly reviews and confirms installation.
+- Added release notes, publication date, and installer size to update review.

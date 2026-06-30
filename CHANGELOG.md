@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.12
+
+- Made update checks read-only until the user explicitly reviews and confirms installation.
+- Added release notes, publication date, and installer size to update review.
+
 ## 0.0.11
 
 - Open the application in a maximized window.

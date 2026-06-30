@@ -102,6 +102,7 @@ type UpdateCheckResult = {
   currentVersion: string;
   date?: string | null;
   body?: string | null;
+  downloadSize?: number | null;
 };
 
 type UpdateAvailabilityState =
@@ -390,6 +391,14 @@ function updateChangeList(body?: string | null) {
   return updateChangeList(currentReleaseNotes);
 }
 
+function formatUpdateSize(size?: number | null) {
+  if (!size || size <= 0) return "Size unavailable";
+  const megabytes = size / (1024 * 1024);
+  return megabytes >= 1
+    ? `${megabytes.toFixed(megabytes >= 10 ? 1 : 2)} MB`
+    : `${Math.max(1, Math.round(size / 1024))} KB`;
+}
+
 function App() {
   const displayVersion = `${packageInfo.version}${WORKING_VERSION_SUFFIX}`;
   const [page, setPage] = useState<"app" | "patch" | "timeline" | "stage">("app");
@@ -447,6 +456,7 @@ function App() {
   const [sharedVolume, setSharedVolume] = useState(0.8);
   const [projectSessionKey, setProjectSessionKey] = useState(0);
   const [checkingForUpdates, setCheckingForUpdates] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updateAvailability, setUpdateAvailability] =
     useState<UpdateAvailabilityState>("idle");
   const [availableUpdate, setAvailableUpdate] = useState<UpdateCheckResult | null>(null);
@@ -1121,26 +1131,7 @@ function App() {
       setAvailableUpdate(update);
       setUpdateAvailability("available");
       setUpdateStatusDetail(`Disaster ${update.version} is available to install.`);
-
-      const details = [
-        `Disaster ${update.version} is available.`,
-        update.date ? `Published: ${update.date}` : null,
-        update.body?.trim() ? "" : null,
-        update.body?.trim() || null,
-        "",
-        "Install it now? The app will restart after the update finishes.",
-      ]
-        .filter(Boolean)
-        .join("\n");
-
-      if (!window.confirm(details)) {
-        setStatus(`Update ${update.version} is ready when you want it.`);
-        return;
-      }
-
-      setStatus(`Installing Disaster ${update.version} update...`);
-      setUpdateStatusDetail(`Installing Disaster ${update.version} update...`);
-      await invoke("install_pending_update");
+      setStatus(`Update ${update.version} is available. Review it before installing.`);
     } catch (error) {
       const nextAvailability = getUpdateAvailabilityFromError(error);
       setAvailableUpdate(null);
@@ -1151,6 +1142,51 @@ function App() {
       }
     } finally {
       setCheckingForUpdates(false);
+    }
+  }
+
+  async function installAvailableUpdate() {
+    if (!availableUpdate || installingUpdate) return;
+
+    const changes = updateChangeList(availableUpdate.body);
+    const details = [
+      `Install Disaster ${availableUpdate.version}?`,
+      `Download size: ${formatUpdateSize(availableUpdate.downloadSize)}`,
+      availableUpdate.date ? `Published: ${availableUpdate.date}` : null,
+      "",
+      "Changes:",
+      ...changes.map((change) => `• ${change}`),
+      "",
+      "The application will restart after installation.",
+    ]
+      .filter((line): line is string => line !== null)
+      .join("\n");
+
+    const approved = isTauri()
+      ? await confirm(details, {
+          title: "Confirm Disaster update",
+          kind: "info",
+          okLabel: "Yes, install",
+          cancelLabel: "Not now",
+        })
+      : window.confirm(details);
+    if (!approved) {
+      setStatus(`Update ${availableUpdate.version} was not installed.`);
+      return;
+    }
+
+    setInstallingUpdate(true);
+    setStatus(`Installing Disaster ${availableUpdate.version} update...`);
+    setUpdateStatusDetail(`Installing Disaster ${availableUpdate.version} update...`);
+    try {
+      await invoke("install_pending_update");
+    } catch (error) {
+      const message = getUpdateErrorMessage(error);
+      setStatus(message);
+      setUpdateStatusDetail(message);
+      setUpdateAvailability("error");
+    } finally {
+      setInstallingUpdate(false);
     }
   }
 
@@ -2060,7 +2096,7 @@ function clearFixture(fixture: PatchedFixture) {
               <button
                 className="appInfoActionButton"
                 onClick={() => void checkForUpdates(true)}
-                disabled={checkingForUpdates}
+                disabled={checkingForUpdates || installingUpdate}
               >
                 {checkingForUpdates ? "Checking..." : "Check now"}
               </button>
@@ -2095,6 +2131,28 @@ function clearFixture(fixture: PatchedFixture) {
                   <li key={change}>{change}</li>
                 ))}
               </ul>
+              {availableUpdate ? (
+                <>
+                  <div className="appUpdaterMetadata">
+                    <span>
+                      <small>DOWNLOAD</small>
+                      <strong>{formatUpdateSize(availableUpdate.downloadSize)}</strong>
+                    </span>
+                    <span>
+                      <small>PUBLISHED</small>
+                      <strong>{availableUpdate.date ?? "Unknown"}</strong>
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="appInfoActionButton appUpdaterInstallButton"
+                    disabled={installingUpdate}
+                    onClick={() => void installAvailableUpdate()}
+                  >
+                    {installingUpdate ? "Installing..." : "Review and install"}
+                  </button>
+                </>
+              ) : null}
             </div>
           </article>
 

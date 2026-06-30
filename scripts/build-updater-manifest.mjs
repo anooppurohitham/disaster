@@ -135,6 +135,7 @@ for (const signaturePath of allFiles.filter((file) => file.endsWith(".sig"))) {
   platforms[target] = {
     url: `${normalizedReleaseBaseUrl}/${encodeURIComponent(fileName)}`,
     signature: fs.readFileSync(signaturePath, "utf8").trim(),
+    size: fs.statSync(assetPath).size,
   };
 }
 

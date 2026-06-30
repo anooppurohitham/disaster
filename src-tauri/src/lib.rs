@@ -63,6 +63,7 @@ struct UpdateCheckResult {
     current_version: String,
     date: Option<String>,
     body: Option<String>,
+    download_size: Option<u64>,
 }
 
 #[tauri::command]
@@ -313,11 +314,27 @@ async fn check_for_updates(
         .await
         .map_err(|e| e.to_string())?;
 
-    let result = update.as_ref().map(|update| UpdateCheckResult {
-        version: update.version.clone(),
-        current_version: update.current_version.clone(),
-        date: update.date.as_ref().map(|date| date.to_string()),
-        body: update.body.clone(),
+    let result = update.as_ref().map(|update| {
+        let download_size = update
+            .raw_json
+            .get("platforms")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|platforms| {
+                platforms.values().find(|platform| {
+                    platform.get("url").and_then(serde_json::Value::as_str)
+                        == Some(update.download_url.as_str())
+                })
+            })
+            .and_then(|platform| platform.get("size"))
+            .and_then(serde_json::Value::as_u64);
+
+        UpdateCheckResult {
+            version: update.version.clone(),
+            current_version: update.current_version.clone(),
+            date: update.date.as_ref().map(|date| date.to_string()),
+            body: update.body.clone(),
+            download_size,
+        }
     });
 
     let mut guard = pending_update
