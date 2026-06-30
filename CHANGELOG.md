@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.11
+
+- Open the application in a maximized window.
+- Edit a color transition’s duration by clicking its transition bubble.
+
 ## 0.0.10
 
 - Restored Ctrl/Command range selection without blocking graph editing.

@@ -3655,6 +3655,10 @@ function ColorLane({ fixtureId, clips, transitions, zoom, grid, duration, width,
   onRequestColorTransition: (fixtureId: string, leftClipId: string, rightClipId: string) => void;
   onOpenItemContextMenu: (menu: ItemContextMenuState) => void;
 }) {
+  const [transitionLengthEditor, setTransitionLengthEditor] = useState<{
+    id: string;
+    duration: number;
+  } | null>(null);
   const lastEnd = clips.reduce((end, clip) => Math.max(end, clip.start + clip.duration), 0);
   const sortedClips = [...clips].sort((a, b) => a.start - b.start);
   const touchingBoundaries = sortedClips.slice(0, -1).flatMap((leftClip, index) => {
@@ -3666,7 +3670,69 @@ function ColorLane({ fixtureId, clips, transitions, zoom, grid, duration, width,
   });
   const commit = (next: ColorClip[]) =>
     onChange(rippleColors(next, duration), transitions);
-  return <div className="parameterLane colorLane" style={{ width }}>
+
+  const saveTransitionLength = () => {
+    if (!transitionLengthEditor) return;
+    const transition = transitions.find(
+      (item) => item.id === transitionLengthEditor.id,
+    );
+    if (!transition) {
+      setTransitionLengthEditor(null);
+      return;
+    }
+
+    const oldHalf = transition.duration / 2;
+    const boundary = transition.boundary ?? transition.start + oldHalf;
+    const leftClip = clips.find((clip) => clip.id === transition.leftClipId);
+    const rightClip = clips.find((clip) => clip.id === transition.rightClipId);
+    const availableHalf = Math.max(
+      0.05,
+      Math.min(
+        boundary,
+        duration - boundary,
+        leftClip ? leftClip.duration + oldHalf - 0.05 : Number.POSITIVE_INFINITY,
+        rightClip ? rightClip.duration + oldHalf - 0.05 : Number.POSITIVE_INFINITY,
+      ),
+    );
+    const nextHalf = Math.min(
+      availableHalf,
+      Math.max(0.05, transitionLengthEditor.duration / 2),
+    );
+    const halfDelta = nextHalf - oldHalf;
+
+    onChange(
+      clips.map((clip) => {
+        if (clip.id === transition.leftClipId) {
+          return {
+            ...clip,
+            duration: Math.max(0.05, clip.duration - halfDelta),
+          };
+        }
+        if (clip.id === transition.rightClipId) {
+          return {
+            ...clip,
+            start: clip.start + halfDelta,
+            duration: Math.max(0.05, clip.duration - halfDelta),
+          };
+        }
+        return clip;
+      }),
+      transitions.map((item) =>
+        item.id === transition.id
+          ? {
+              ...item,
+              start: boundary - nextHalf,
+              duration: nextHalf * 2,
+              boundary,
+            }
+          : item,
+      ),
+    );
+    setTransitionLengthEditor(null);
+  };
+
+  return <>
+  <div className="parameterLane colorLane" style={{ width }}>
     <LaneBeatLines beatTimes={beatTimes} zoom={zoom} />
     <span>COLOR</span>
     {clips.map((clip, index) => (
@@ -3706,6 +3772,13 @@ function ColorLane({ fixtureId, clips, transitions, zoom, grid, duration, width,
           background: `linear-gradient(90deg, ${transition.fromColor}, ${transition.toColor})`,
         } as CSSProperties}
         title={`${transition.duration.toFixed(1)} second color transition`}
+        onClick={(event) => {
+          event.stopPropagation();
+          setTransitionLengthEditor({
+            id: transition.id,
+            duration: transition.duration,
+          });
+        }}
         onContextMenu={(event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -3740,7 +3813,67 @@ function ColorLane({ fixtureId, clips, transitions, zoom, grid, duration, width,
     <button className="addColorButton" style={{ left: lastEnd * zoom + 6 }} disabled={lastEnd >= duration}
       onClick={() => commit([...clips, { id: uid(), start: snap(lastEnd, grid),
         duration: Math.min(4, duration - lastEnd), color: COLORS[clips.length % COLORS.length] }])}>+</button>
-  </div>;
+  </div>
+  {transitionLengthEditor ? (
+    <div
+      className="effectDialogBackdrop"
+      onPointerDown={() => setTransitionLengthEditor(null)}
+    >
+      <div
+        className="effectDialog colorTransitionDialog"
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        <div className="effectDialogHeader">
+          <div>
+            <strong>Edit color transition</strong>
+            <span>Change how long the blend between these colors lasts.</span>
+          </div>
+          <button type="button" onClick={() => setTransitionLengthEditor(null)}>
+            ×
+          </button>
+        </div>
+        <label>
+          Transition duration
+          <div className="transitionDurationInput">
+            <input
+              type="number"
+              min="0.1"
+              max="30"
+              step="0.1"
+              value={transitionLengthEditor.duration}
+              onChange={(event) =>
+                setTransitionLengthEditor((previous) =>
+                  previous
+                    ? {
+                        ...previous,
+                        duration: Math.max(0.1, Number(event.target.value)),
+                      }
+                    : previous,
+                )
+              }
+            />
+            <span>seconds</span>
+          </div>
+        </label>
+        <div className="effectDialogActions">
+          <span />
+          <div>
+            <button type="button" onClick={() => setTransitionLengthEditor(null)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="primaryButton"
+              onClick={saveTransitionLength}
+            >
+              Save length
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  ) : null}
+  </>;
 }
 
 const ColorClipBlock = memo(function ColorClipBlock({

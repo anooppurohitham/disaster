@@ -1,5 +1,4 @@
 ## Recent changes
 
-- Restored Ctrl/Command range selection without blocking graph editing.
-- Prevented color blocks from overlapping their preceding color transitions.
-- Synchronized updater Recent Changes with the matching GitHub release description.
+- Open the application in a maximized window.
+- Edit a color transition’s duration by clicking its transition bubble.
