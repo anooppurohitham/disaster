@@ -1,5 +1,10 @@
-import { memo, useEffect, useRef, useState, type CSSProperties } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { getFixtureMode, type PatchedFixture } from "./App";
+import {
+  createPlaceholderWaveform,
+  extractWaveformSamples,
+  getWaveformSampleCount,
+} from "./audioWaveform";
 
 type Point = { time: number; value: number };
 type ColorClip = { id: string; start: number; duration: number; color: string };
@@ -13,7 +18,13 @@ type ColorTransition = {
   rightClipId?: string;
   boundary?: number;
 };
-type StrobeClip = { id: string; start: number; duration: number; rate: number };
+type StrobeClip = {
+  id: string;
+  start: number;
+  duration: number;
+  rate: number;
+  endRate?: number;
+};
 type PulseEffect = {
   id: string;
   type: "pulse";
@@ -22,6 +33,8 @@ type PulseEffect = {
   activeLength: number;
   spacingLength: number;
   intensity: number;
+  startRate?: number;
+  endRate?: number;
 };
 type SlopeEffect = {
   id: string;
@@ -99,22 +112,31 @@ type ParsedCueCommand = {
   end: number;
   intensity: number | null;
   color: string | null;
-  strobe: number | null;
+  strobeStartRate: number | null;
+  strobeEndRate: number | null;
   clearStrobe: boolean;
-  intensityEffect: "pulse" | "fade" | "rise" | null;
+  intensityEffect: "pulse" | "fade" | "rise" | "random" | "spline" | null;
   pulseActiveLength: number;
   pulseSpacingLength: number;
+  pulseStartRate: number | null;
+  pulseEndRate: number | null;
+  randomStep: number | null;
   transitionFromColor: string | null;
   transitionToColor: string | null;
 };
 
-type TimelineHistorySnapshot = {
+export type TimelineHistorySnapshot = {
   tracks: Record<string, TrackData>;
   duration: number;
   fixtureGroups: FixtureGroup[];
 };
 
-const LABEL_WIDTH = 240;
+export type TimelineHistoryState = {
+  undo: TimelineHistorySnapshot[];
+  redo: TimelineHistorySnapshot[];
+};
+
+const LABEL_WIDTH = 156;
 const COLORS = ["#3185ff", "#e246b6", "#ffb52e", "#55d982", "#f2f4f8", "#ef5350"];
 const CUE_COLORS: Array<[string, string]> = [
   ["warm white", "#ffd8a8"],
@@ -204,6 +226,95 @@ function parseCueTime(value: string) {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
+function cloneFixtureGroups(groups: FixtureGroup[]) {
+  return groups.map((group) => ({
+    ...group,
+    fixtureIds: [...group.fixtureIds],
+  }));
+}
+
+function cloneTrackMap(tracks: Record<string, TrackData>) {
+  return Object.fromEntries(
+    Object.entries(tracks).map(([key, value]) => [key, normalizeTrackData(value)]),
+  );
+}
+
+function cloneHistorySnapshot(snapshot: TimelineHistorySnapshot): TimelineHistorySnapshot {
+  return {
+    tracks: cloneTrackMap(snapshot.tracks),
+    duration: snapshot.duration,
+    fixtureGroups: cloneFixtureGroups(snapshot.fixtureGroups),
+  };
+}
+
+function buildStageRowLayout(placements: StagePlacement[]) {
+  const sorted = [...placements].sort((left, right) => left.y - right.y);
+  const rows: Array<{ fixtureIds: string[]; center: number }> = [];
+  const tolerance = 0.075;
+
+  sorted.forEach((placement) => {
+    const existingRow = rows.find((row) => Math.abs(row.center - placement.y) <= tolerance);
+    if (existingRow) {
+      existingRow.fixtureIds.push(placement.fixtureId);
+      existingRow.center =
+        (existingRow.center * (existingRow.fixtureIds.length - 1) + placement.y) /
+        existingRow.fixtureIds.length;
+      return;
+    }
+
+    rows.push({ fixtureIds: [placement.fixtureId], center: placement.y });
+  });
+
+  const rowByFixtureId = new Map<string, number>();
+  rows.forEach((row, index) => {
+    row.fixtureIds.forEach((fixtureId) => rowByFixtureId.set(fixtureId, index));
+  });
+
+  return { rowByFixtureId, rowCount: rows.length };
+}
+
+function parseRequestedStageRow(normalized: string) {
+  if (/\b(front|first)\s+row\b/.test(normalized)) {
+    return { index: 0, label: "front row" };
+  }
+  if (/\b(back|rear|last)\s+row\b/.test(normalized)) {
+    return { index: -1, label: "last row" };
+  }
+
+  const ordinalMap: Record<string, number> = {
+    first: 0,
+    second: 1,
+    third: 2,
+    fourth: 3,
+    fifth: 4,
+    sixth: 5,
+    seventh: 6,
+    eighth: 7,
+    ninth: 8,
+    tenth: 9,
+  };
+  const ordinalMatch = normalized.match(
+    /\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+row\b/,
+  );
+  if (ordinalMatch) {
+    return {
+      index: ordinalMap[ordinalMatch[1]],
+      label: `${ordinalMatch[1]} row`,
+    };
+  }
+
+  const numericMatch = normalized.match(/\brow\s+(\d{1,2})\b|\b(\d{1,2})(?:st|nd|rd|th)\s+row\b/);
+  const numericValue = numericMatch?.[1] ?? numericMatch?.[2];
+  if (numericValue) {
+    const parsed = Number.parseInt(numericValue, 10);
+    if (Number.isFinite(parsed) && parsed >= 1) {
+      return { index: parsed - 1, label: `row ${parsed}` };
+    }
+  }
+
+  return null;
+}
+
 function parseCueCommand(
   input: string,
   fixtures: PatchedFixture[],
@@ -217,6 +328,7 @@ function parseCueCommand(
   const explicitlyNamed = fixtures.filter((fixture) =>
     normalized.includes(fixture.name.toLowerCase()),
   );
+  const requestedRow = parseRequestedStageRow(normalized);
   const spatialWords = {
     left: /\bleft\b/.test(normalized),
     right: /\bright\b/.test(normalized),
@@ -224,10 +336,17 @@ function parseCueCommand(
     back: /\b(back|rear)\b/.test(normalized),
     center: /\b(center|centre|middle)\b/.test(normalized),
   };
-  const hasSpatialTarget = Object.values(spatialWords).some(Boolean);
+  const hasSpatialTarget = Object.values(spatialWords).some(Boolean) || requestedRow !== null;
   const placementByFixtureId = new Map(
     placements.map((placement) => [placement.fixtureId, placement]),
   );
+  const stageRows = buildStageRowLayout(placements);
+  const resolvedRowIndex =
+    requestedRow === null
+      ? null
+      : requestedRow.index < 0
+        ? Math.max(0, stageRows.rowCount - 1)
+        : requestedRow.index;
 
   let targets: PatchedFixture[];
   let targetLabel: string;
@@ -238,6 +357,12 @@ function parseCueCommand(
     targets = fixtures.filter((fixture) => {
       const placement = placementByFixtureId.get(fixture.id);
       if (!placement) return false;
+      const placementRow = stageRows.rowByFixtureId.get(fixture.id);
+      if (resolvedRowIndex !== null) {
+        if (stageRows.rowCount === 0 || placementRow === undefined) return false;
+        if (resolvedRowIndex >= stageRows.rowCount) return false;
+        if (placementRow !== resolvedRowIndex) return false;
+      }
       if (spatialWords.left && !spatialWords.right && placement.x >= 0.5) return false;
       if (spatialWords.right && !spatialWords.left && placement.x < 0.5) return false;
       if (
@@ -258,6 +383,7 @@ function parseCueCommand(
       return true;
     });
     targetLabel = [
+      requestedRow?.label ?? "",
       spatialWords.front ? "front" : "",
       spatialWords.back ? "back" : "",
       spatialWords.left ? "left" : "",
@@ -265,6 +391,11 @@ function parseCueCommand(
       spatialWords.center ? "center" : "",
       "fixtures",
     ].filter(Boolean).join(" ");
+    if (requestedRow && resolvedRowIndex !== null && resolvedRowIndex >= stageRows.rowCount) {
+      throw new Error(
+        `The stage only has ${stageRows.rowCount} row${stageRows.rowCount === 1 ? "" : "s"}, so ${requestedRow.label} is unavailable.`,
+      );
+    }
     if (!targets.length) {
       throw new Error(`No placed fixtures match “${targetLabel}”. Arrange them in Stage View first.`);
     }
@@ -312,17 +443,28 @@ function parseCueCommand(
 
   const clearStrobe = /\b(steady|strobe off|stop strobing|no strobe)\b/.test(normalized);
   const wantsPulse = /\b(pulse|pulsing|pulsate|pulsating|flash|flashing|blink|blinking)\b/.test(normalized);
+  const wantsRandomIntensity =
+    /\b(random|randomize|randomise|chaotic|scatter(?:ed)?|shimmer)\b/.test(normalized) &&
+    /\b(intensity|dimmer|brightness|lights?)\b/.test(normalized);
   const wantsRise =
     /\b(fade in|fade up|rise|rising|gradually (?:turn|come) on|gradually brighten|slowly brighten)\b/.test(normalized);
   const wantsFade =
     !wantsRise &&
     /\b(fade|fading|fade out|fade down|gradually (?:turn|go) off|gradually dim|slowly dim)\b/.test(normalized);
+  const wantsSpline =
+    !wantsPulse &&
+    !wantsRandomIntensity &&
+    /\b(spline|smooth curve|curved|curve|ease(?:d|s)?|smoothly shaped)\b/.test(normalized);
   let intensityEffect: ParsedCueCommand["intensityEffect"] = wantsPulse
     ? "pulse"
+    : wantsRandomIntensity
+      ? "random"
     : wantsRise
       ? "rise"
       : wantsFade
         ? "fade"
+        : wantsSpline
+          ? "spline"
         : null;
   const percentMatch = normalized.match(/(\d+(?:\.\d+)?)\s*%/);
   let intensity: number | null = percentMatch
@@ -370,25 +512,48 @@ function parseCueCommand(
 
   // Only explicit strobe language is allowed to manipulate a fixture's strobe channel.
   const wantsStrobe = /\b(strobe|strobing)\b/.test(normalized);
-  const rateMatch = normalized.match(/(\d+(?:\.\d+)?)\s*hz\b/);
-  let strobe: number | null = null;
+  let strobeStartRate: number | null = null;
+  let strobeEndRate: number | null = null;
   if (wantsStrobe && !clearStrobe) {
-    strobe = rateMatch
-      ? Math.min(30, Math.max(0.5, Number(rateMatch[1])))
-      : /\bfast\b/.test(normalized)
-        ? 16
-        : /\bslow\b/.test(normalized)
-          ? 4
-          : 8;
+    const fallbackRate = /\bfast\b/.test(normalized)
+      ? 16
+      : /\bslow\b/.test(normalized)
+        ? 4
+        : 8;
+    const ramp = parseRateRamp(normalized, "strobe", fallbackRate);
+    strobeStartRate = ramp.startRate;
+    strobeEndRate = ramp.endRate;
   }
 
-  if ((color || strobe !== null) && intensity === null) intensity = 1;
+  const pulseFallbackRate = /\bfast\b/.test(normalized)
+    ? 4.5
+    : /\bslow\b/.test(normalized)
+      ? 1.25
+      : 2.5;
+  const pulseRateRamp = intensityEffect === "pulse"
+    ? parseRateRamp(normalized, "pulse", pulseFallbackRate)
+    : { startRate: null, endRate: null };
+
+  const pulseStartRate = pulseRateRamp.startRate;
+  const pulseEndRate = pulseRateRamp.endRate;
+  const pulseCycle = pulseStartRate ? 1 / pulseStartRate : null;
+  const pulseDutyCycle = 0.5;
+  const randomStep =
+    intensityEffect === "random"
+      ? /\bfast\b/.test(normalized)
+        ? 0.15
+        : /\bslow\b/.test(normalized)
+          ? 0.75
+          : 0.35
+      : null;
+
+  if ((color || strobeStartRate !== null) && intensity === null) intensity = 1;
   if (wantsColorTransition && intensity === null) intensity = 1;
   if (intensityEffect && intensity === null) intensity = 1;
   if (
     intensity === null &&
     !color &&
-    strobe === null &&
+    strobeStartRate === null &&
     !clearStrobe &&
     !intensityEffect &&
     !wantsColorTransition
@@ -405,25 +570,23 @@ function parseCueCommand(
     end,
     intensity,
     color,
-    strobe,
+    strobeStartRate,
+    strobeEndRate,
     clearStrobe,
     intensityEffect,
-    pulseActiveLength: /\bfast\b/.test(normalized)
-      ? 0.15
-      : /\bslow\b/.test(normalized)
-        ? 0.75
-        : 0.35,
-    pulseSpacingLength: /\bfast\b/.test(normalized)
-      ? 0.15
-      : /\bslow\b/.test(normalized)
-        ? 0.75
-        : 0.35,
+    pulseActiveLength: pulseCycle ? pulseCycle * pulseDutyCycle : 0.35,
+    pulseSpacingLength: pulseCycle ? pulseCycle * (1 - pulseDutyCycle) : 0.35,
+    pulseStartRate,
+    pulseEndRate,
+    randomStep,
     transitionFromColor,
     transitionToColor,
   };
 }
 const documentSignature = (document: TimelineDocumentData | null) => JSON.stringify(document ?? null);
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
+const clampRate = (value: number) => Math.min(30, Math.max(0.5, value));
+const lerp = (start: number, end: number, amount: number) => start + (end - start) * amount;
 const seededRandom = (seed: number) => {
   const x = Math.sin(seed) * 10000;
   return x - Math.floor(x);
@@ -492,6 +655,72 @@ function effectToEditorValues(effect: IntensityEffect): EffectEditorValues {
     lengthBars: 1,
     lengthMode: "time",
   };
+}
+
+function speedWordToRate(word: string, kind: "pulse" | "strobe") {
+  const normalized = word.toLowerCase();
+  if (kind === "pulse") {
+    if (/slow/.test(normalized)) return 1.25;
+    if (/fast|rapid|quick/.test(normalized)) return 4.5;
+    return 2.5;
+  }
+  if (/slow/.test(normalized)) return 4;
+  if (/fast|rapid|quick/.test(normalized)) return 16;
+  return 8;
+}
+
+function parseRateRamp(
+  normalized: string,
+  kind: "pulse" | "strobe",
+  fallbackRate: number,
+) {
+  const hzMatches = Array.from(
+    normalized.matchAll(/(\d+(?:\.\d+)?)\s*hz\b/g),
+    (match) => clampRate(Number(match[1])),
+  );
+  if (hzMatches.length >= 2) {
+    return { startRate: hzMatches[0], endRate: hzMatches[hzMatches.length - 1] };
+  }
+  if (hzMatches.length === 1) {
+    return { startRate: hzMatches[0], endRate: hzMatches[0] };
+  }
+
+  const speedMatches = Array.from(
+    normalized.matchAll(/\b(slow(?:ly)?|slower|fast(?:ly)?|faster|rapid(?:ly)?|quick(?:ly)?)\b/g),
+    (match) => match[1],
+  );
+  if (speedMatches.length >= 2) {
+    return {
+      startRate: speedWordToRate(speedMatches[0], kind),
+      endRate: speedWordToRate(speedMatches[speedMatches.length - 1], kind),
+    };
+  }
+  if (speedMatches.length === 1) {
+    const rate = speedWordToRate(speedMatches[0], kind);
+    return { startRate: rate, endRate: rate };
+  }
+  if (/\b(speed up|accelerat|build faster|start slow.*end fast)\b/.test(normalized)) {
+    return {
+      startRate: speedWordToRate("slow", kind),
+      endRate: speedWordToRate("fast", kind),
+    };
+  }
+  if (/\b(slow down|decelerat|start fast.*end slow)\b/.test(normalized)) {
+    return {
+      startRate: speedWordToRate("fast", kind),
+      endRate: speedWordToRate("slow", kind),
+    };
+  }
+  return { startRate: fallbackRate, endRate: fallbackRate };
+}
+
+function formatRateRange(startRate: number | null, endRate: number | null, suffix: string) {
+  if (startRate === null || endRate === null) return "";
+  const startText = Number.isInteger(startRate) ? `${startRate}` : startRate.toFixed(1);
+  const endText = Number.isInteger(endRate) ? `${endRate}` : endRate.toFixed(1);
+  return Math.abs(startRate - endRate) < 0.05
+    ? `${startText} ${suffix}`
+    : `${startText} to ${endText} ${suffix}`;
 }
 
 function createDefaultEffectEditorValues(_type: EffectType, span: number, grid: number, beatInterval: number): EffectEditorValues {
@@ -564,14 +793,26 @@ function buildEffectPoints(effect: IntensityEffect): Point[] {
   if (effect.type === "pulse") {
     const points: Point[] = [{ time: start, value: 0 }];
     let cursor = start;
+    const dutyCycle = Math.min(
+      0.95,
+      Math.max(0.05, effect.activeLength / Math.max(0.001, effect.activeLength + effect.spacingLength)),
+    );
     while (cursor < end) {
-      const activeEnd = Math.min(end, cursor + effect.activeLength);
+      const progress = Math.min(1, Math.max(0, (cursor - start) / Math.max(0.001, effect.duration)));
+      const currentRate =
+        effect.startRate !== undefined && effect.endRate !== undefined
+          ? clampRate(lerp(effect.startRate, effect.endRate, progress))
+          : null;
+      const cycleLength = currentRate ? 1 / currentRate : effect.activeLength + effect.spacingLength;
+      const activeLength = currentRate ? cycleLength * dutyCycle : effect.activeLength;
+      const spacingLength = currentRate ? Math.max(0.01, cycleLength - activeLength) : effect.spacingLength;
+      const activeEnd = Math.min(end, cursor + activeLength);
       points.push({ time: cursor, value: effect.intensity });
       points.push({ time: activeEnd, value: effect.intensity });
       if (activeEnd < end) {
         points.push({ time: activeEnd, value: 0 });
       }
-      cursor = activeEnd + effect.spacingLength;
+      cursor = activeEnd + spacingLength;
       if (cursor < end) {
         points.push({ time: cursor, value: 0 });
       }
@@ -687,6 +928,7 @@ export default function TimelineEditor({
   requestedAudioFile,
   onRequestedAudioHandled,
   initialDocumentState,
+  initialHistoryState,
   stagePlacements,
   stages,
   activeStageId,
@@ -696,6 +938,7 @@ export default function TimelineEditor({
   onRemoveStage,
   volume,
   onVolumeChange,
+  onHistoryStateChange,
 }: {
   fixtures: PatchedFixture[];
   onOutputFrame: (
@@ -711,6 +954,7 @@ export default function TimelineEditor({
   requestedAudioFile: { id: string; file: File } | null;
   onRequestedAudioHandled: () => void;
   initialDocumentState: TimelineDocumentData | null;
+  initialHistoryState: TimelineHistoryState | null;
   stagePlacements: StagePlacement[];
   stages: StageTab[];
   activeStageId: string;
@@ -720,6 +964,7 @@ export default function TimelineEditor({
   onRemoveStage: (stageId: string) => void;
   volume: number;
   onVolumeChange: (volume: number) => void;
+  onHistoryStateChange: (history: TimelineHistoryState) => void;
 }) {
   const rootRef = useRef<HTMLElement>(null);
   const [zoom, setZoom] = useState(initialDocumentState?.zoom ?? 80);
@@ -744,6 +989,11 @@ export default function TimelineEditor({
   const [selectedFixtureIds, setSelectedFixtureIds] = useState<string[]>(
     initialDocumentState?.selectedFixtureId ? [initialDocumentState.selectedFixtureId] : fixtures[0]?.id ? [fixtures[0].id] : [],
   );
+  const [draggedLibraryFixtureId, setDraggedLibraryFixtureId] = useState<string | null>(null);
+  const [libraryDropTarget, setLibraryDropTarget] = useState<{
+    fixtureId: string;
+    placement: "before" | "after";
+  } | null>(null);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selections, setSelections] = useState<Selection[]>([]);
   const [clipboard, setClipboard] = useState<TrackData | null>(null);
@@ -783,17 +1033,19 @@ export default function TimelineEditor({
   const audioUrlRef = useRef("");
   const loadedAudioSourceRef = useRef<string | null>(null);
   const requestedAudioIdRef = useRef<string | null>(null);
-  const undoStackRef = useRef<TimelineHistorySnapshot[]>([]);
-  const redoStackRef = useRef<TimelineHistorySnapshot[]>([]);
+  const undoStackRef = useRef<TimelineHistorySnapshot[]>(
+    initialHistoryState?.undo.map(cloneHistorySnapshot) ?? [],
+  );
+  const redoStackRef = useRef<TimelineHistorySnapshot[]>(
+    initialHistoryState?.redo.map(cloneHistorySnapshot) ?? [],
+  );
   const hydratingDocumentRef = useRef(false);
   const hydrationFrameRef = useRef<number | null>(null);
   const lastEmittedDocumentSignatureRef = useRef<string | null>(null);
   const [waveform, setWaveform] = useState<number[]>(
     initialDocumentState?.waveform?.length
       ? initialDocumentState.waveform
-      : Array.from({ length: 180 }, (_, index) =>
-          0.15 + Math.abs(Math.sin(index * 0.41) * Math.cos(index * 0.13)) * 0.7,
-        ),
+      : createPlaceholderWaveform(180),
   );
   const timelineScale = Math.max(
     zoom,
@@ -808,6 +1060,24 @@ export default function TimelineEditor({
 
   function makeDefaultTrackData(): TrackData {
     return normalizeTrackData();
+  }
+
+  function syncHistoryState() {
+    onHistoryStateChange({
+      undo: undoStackRef.current.map(cloneHistorySnapshot),
+      redo: redoStackRef.current.map(cloneHistorySnapshot),
+    });
+  }
+
+  function currentHistorySnapshot() {
+    return cloneHistorySnapshot({ tracks, duration, fixtureGroups });
+  }
+
+  function pushUndoSnapshot(snapshot: TimelineHistorySnapshot) {
+    undoStackRef.current.push(cloneHistorySnapshot(snapshot));
+    if (undoStackRef.current.length > 100) undoStackRef.current.shift();
+    redoStackRef.current = [];
+    syncHistoryState();
   }
 
   function isNeutralTrackData(track?: TrackData) {
@@ -856,9 +1126,16 @@ export default function TimelineEditor({
           (currentPlayhead - activeTransition.start) / Math.max(0.001, activeTransition.duration),
         )
       : solidColor;
-    const strobe = [...data.strobes].reverse().find(
+    const activeStrobe = [...data.strobes].reverse().find(
       (clip) => currentPlayhead >= clip.start && currentPlayhead < clip.start + clip.duration,
-    )?.rate ?? null;
+    ) ?? null;
+    const strobe = activeStrobe
+      ? lerp(
+          activeStrobe.rate,
+          activeStrobe.endRate ?? activeStrobe.rate,
+          Math.min(1, Math.max(0, (currentPlayhead - activeStrobe.start) / Math.max(0.001, activeStrobe.duration))),
+        )
+      : null;
     return { intensity, color, strobe };
   }
 
@@ -904,6 +1181,7 @@ export default function TimelineEditor({
     if (incomingDocumentSignature === lastEmittedDocumentSignatureRef.current) {
       return;
     }
+    lastEmittedDocumentSignatureRef.current = incomingDocumentSignature;
 
     hydratingDocumentRef.current = true;
     if (hydrationFrameRef.current !== null) {
@@ -956,12 +1234,11 @@ export default function TimelineEditor({
     setWaveform(
       initialDocumentState?.waveform?.length
         ? initialDocumentState.waveform
-        : Array.from({ length: 180 }, (_, index) =>
-            0.15 + Math.abs(Math.sin(index * 0.41) * Math.cos(index * 0.13)) * 0.7,
-          ),
+        : createPlaceholderWaveform(180),
     );
-    undoStackRef.current = [];
-    redoStackRef.current = [];
+    undoStackRef.current = initialHistoryState?.undo.map(cloneHistorySnapshot) ?? [];
+    redoStackRef.current = initialHistoryState?.redo.map(cloneHistorySnapshot) ?? [];
+    syncHistoryState();
     if (viewportRef.current) {
       viewportRef.current.scrollLeft = 0;
       viewportRef.current.style.setProperty("--track-scroll", "0px");
@@ -985,6 +1262,9 @@ export default function TimelineEditor({
         cancelAnimationFrame(hydrationFrameRef.current);
         hydrationFrameRef.current = null;
       }
+      // A parent update can rerun this effect before its animation frame.
+      // Never leave document syncing permanently disabled after cancellation.
+      hydratingDocumentRef.current = false;
     };
   }, [initialDocumentState, initialAudioSourceUrl, fixtures]);
 
@@ -1211,9 +1491,7 @@ export default function TimelineEditor({
   ]);
 
   function updateTrack(fixtureId: string, data: TrackData) {
-    undoStackRef.current.push({ tracks, duration, fixtureGroups });
-    if (undoStackRef.current.length > 100) undoStackRef.current.shift();
-    redoStackRef.current = [];
+    pushUndoSnapshot(currentHistorySnapshot());
     setTracks((previous) => ({
       ...previous,
       [fixtureId]: normalizeTrackData(data),
@@ -1221,9 +1499,7 @@ export default function TimelineEditor({
   }
 
   function commitTracks(nextTracks: Record<string, TrackData>) {
-    undoStackRef.current.push({ tracks, duration, fixtureGroups });
-    if (undoStackRef.current.length > 100) undoStackRef.current.shift();
-    redoStackRef.current = [];
+    pushUndoSnapshot(currentHistorySnapshot());
     setTracks(nextTracks);
   }
 
@@ -1304,14 +1580,15 @@ export default function TimelineEditor({
                     !overlapsRegion(transition.start, transition.duration),
                 )
               : track.colorTransitions;
-        const strobes = command.strobe !== null
+        const strobes = command.strobeStartRate !== null
           ? [
               ...track.strobes.filter((clip) => !overlapsRegion(clip.start, clip.duration)),
               {
                 id: uid(),
                 start: regionStart,
                 duration: regionEnd - regionStart,
-                rate: command.strobe,
+                rate: command.strobeStartRate,
+                endRate: command.strobeEndRate ?? command.strobeStartRate,
               },
             ]
           : command.clearStrobe || command.intensityEffect === "pulse"
@@ -1331,26 +1608,61 @@ export default function TimelineEditor({
 
         if (command.intensityEffect) {
           const effectDuration = regionEnd - regionStart;
-          const effect: IntensityEffect = command.intensityEffect === "pulse"
-            ? {
-                id: uid(),
-                type: "pulse",
-                start: regionStart,
-                duration: effectDuration,
-                activeLength: command.pulseActiveLength,
-                spacingLength: command.pulseSpacingLength,
-                intensity: command.intensity ?? 1,
-              }
-            : {
-                id: uid(),
-                type: command.intensityEffect,
-                start: regionStart,
-                duration: effectDuration,
-                minIntensity: 0,
-                maxIntensity: command.intensity ?? 1,
-                length: effectDuration,
-              };
-          nextTrack = applyEffectToTrack(nextTrack, effect);
+          const effect: IntensityEffect =
+            command.intensityEffect === "pulse"
+              ? {
+                  id: uid(),
+                  type: "pulse",
+                  start: regionStart,
+                  duration: effectDuration,
+                  activeLength: command.pulseActiveLength,
+                  spacingLength: command.pulseSpacingLength,
+                  intensity: command.intensity ?? 1,
+                  startRate: command.pulseStartRate ?? undefined,
+                  endRate: command.pulseEndRate ?? command.pulseStartRate ?? undefined,
+                }
+              : command.intensityEffect === "random"
+                ? {
+                    id: uid(),
+                    type: "random",
+                    start: regionStart,
+                    duration: effectDuration,
+                    step: command.randomStep ?? grid,
+                    seed: Math.random() * 100000,
+                  }
+                : command.intensityEffect === "spline"
+                  ? {
+                      id: uid(),
+                      type: "spline",
+                      start: regionStart,
+                      duration: effectDuration,
+                    }
+                  : {
+                      id: uid(),
+                      type: command.intensityEffect,
+                      start: regionStart,
+                      duration: effectDuration,
+                      minIntensity: 0,
+                      maxIntensity: command.intensity ?? 1,
+                      length: effectDuration,
+                    };
+          nextTrack = command.intensityEffect === "spline"
+            ? normalizeTrackData({
+                ...nextTrack,
+                effects: [...nextTrack.effects.filter((effect) => !overlapsRegion(effect.start, effect.duration)), effect],
+                points: [
+                  ...nextTrack.points.filter((point) => point.time < regionStart || point.time > regionEnd),
+                  {
+                    time: regionStart,
+                    value: command.intensity ?? evaluateTrackAtPlayhead(track, regionStart).intensity,
+                  },
+                  {
+                    time: regionEnd,
+                    value: command.intensity ?? evaluateTrackAtPlayhead(track, regionEnd).intensity,
+                  },
+                ],
+              })
+            : applyEffectToTrack(nextTrack, effect);
         }
 
         nextTracks[fixtureId] = nextTrack;
@@ -1362,7 +1674,13 @@ export default function TimelineEditor({
       setSelectedFixtureIds(command.fixtureIds);
       setSelectedFixtureId(command.fixtureIds[0] ?? selectedFixtureId);
       const details = [
-        command.intensityEffect === "pulse" ? "intensity pulse" : "",
+        command.intensityEffect === "pulse"
+          ? `intensity pulse${command.pulseStartRate !== null ? ` (${formatRateRange(command.pulseStartRate, command.pulseEndRate, "Hz")})` : ""}`
+          : "",
+        command.intensityEffect === "random"
+          ? `random intensity${command.randomStep !== null ? ` (${command.randomStep}s step)` : ""}`
+          : "",
+        command.intensityEffect === "spline" ? "smooth spline curve" : "",
         command.intensityEffect === "fade" ? "gradual fade out" : "",
         command.intensityEffect === "rise" ? "gradual fade in" : "",
         command.transitionFromColor && command.transitionToColor
@@ -1372,7 +1690,9 @@ export default function TimelineEditor({
           ? `${Math.round(command.intensity * 100)}% intensity`
           : "",
         command.color ? command.color.toUpperCase() : "",
-        command.strobe !== null ? `${command.strobe} Hz strobe` : "",
+        command.strobeStartRate !== null
+          ? `${formatRateRange(command.strobeStartRate, command.strobeEndRate, "Hz strobe")}`
+          : "",
         command.clearStrobe ? "steady" : "",
       ].filter(Boolean).join(", ");
       setCueAssistantMessages((previous) => [
@@ -1423,9 +1743,7 @@ export default function TimelineEditor({
       name: `${leadFixture.name} Group`,
       fixtureIds: orderedSelection,
     };
-    undoStackRef.current.push({ tracks, duration, fixtureGroups });
-    if (undoStackRef.current.length > 100) undoStackRef.current.shift();
-    redoStackRef.current = [];
+    pushUndoSnapshot(currentHistorySnapshot());
     setFixtureGroups((previous) => [...previous, group]);
     setTracks((previous) => {
       const next = { ...previous, [group.id]: previous[leadFixtureId] ?? makeDefaultTrackData() };
@@ -1445,9 +1763,7 @@ export default function TimelineEditor({
       selectedFixtureId === group.id,
     );
     if (!groupsToRemove.length) return;
-    undoStackRef.current.push({ tracks, duration, fixtureGroups });
-    if (undoStackRef.current.length > 100) undoStackRef.current.shift();
-    redoStackRef.current = [];
+    pushUndoSnapshot(currentHistorySnapshot());
     const groupIdsToRemove = new Set(groupsToRemove.map((group) => group.id));
     setFixtureGroups((previous) => previous.filter((group) => !groupIdsToRemove.has(group.id)));
     setExpandedGroupIds((previous) => previous.filter((groupId) => !groupIdsToRemove.has(groupId)));
@@ -1479,10 +1795,11 @@ export default function TimelineEditor({
   function undoLastChange() {
     const previous = undoStackRef.current.pop();
     if (previous) {
-      redoStackRef.current.push({ tracks, duration, fixtureGroups });
-      setTracks(previous.tracks);
+      redoStackRef.current.push(currentHistorySnapshot());
+      setTracks(cloneTrackMap(previous.tracks));
       setDuration(previous.duration);
-      setFixtureGroups(previous.fixtureGroups);
+      setFixtureGroups(cloneFixtureGroups(previous.fixtureGroups));
+      syncHistoryState();
       return true;
     }
     return false;
@@ -1491,10 +1808,11 @@ export default function TimelineEditor({
   function redoLastChange() {
     const next = redoStackRef.current.pop();
     if (next) {
-      undoStackRef.current.push({ tracks, duration, fixtureGroups });
-      setTracks(next.tracks);
+      undoStackRef.current.push(currentHistorySnapshot());
+      setTracks(cloneTrackMap(next.tracks));
       setDuration(next.duration);
-      setFixtureGroups(next.fixtureGroups);
+      setFixtureGroups(cloneFixtureGroups(next.fixtureGroups));
+      syncHistoryState();
       return true;
     }
     return false;
@@ -1993,15 +2311,7 @@ export default function TimelineEditor({
       const context = new AudioContext();
       const buffer = await context.decodeAudioData(await file.arrayBuffer());
       setDuration(Math.max(10, Math.ceil(buffer.duration)));
-      const data = buffer.getChannelData(0);
-      const bucketSize = Math.max(1, Math.floor(data.length / 400));
-      setWaveform(Array.from({ length: 400 }, (_, bucket) => {
-        let peak = 0;
-        for (let index = bucket * bucketSize; index < Math.min(data.length, (bucket + 1) * bucketSize); index += 1) {
-          peak = Math.max(peak, Math.abs(data[index]));
-        }
-        return Math.max(0.04, peak);
-      }));
+      setWaveform(extractWaveformSamples(buffer, getWaveformSampleCount(buffer.duration)));
       await context.close();
     } catch {
       setAudioName(`${file.name} (preview unavailable)`);
@@ -2179,6 +2489,23 @@ export default function TimelineEditor({
     return items;
   }, []);
 
+  function reorderFixture(
+    draggedId: string,
+    targetId: string,
+    placement: "before" | "after",
+  ) {
+    setFixtureOrder((previous) => {
+      if (draggedId === targetId) return previous;
+      const withoutDragged = previous.filter((id) => id !== draggedId);
+      const targetIndex = withoutDragged.indexOf(targetId);
+      if (targetIndex < 0) return previous;
+      const insertionIndex = placement === "after" ? targetIndex + 1 : targetIndex;
+      const next = [...withoutDragged];
+      next.splice(insertionIndex, 0, draggedId);
+      return next;
+    });
+  }
+
   return (
     <main
       ref={rootRef}
@@ -2275,7 +2602,14 @@ export default function TimelineEditor({
           <button className="librarySection active">Fixtures</button>
           <div className="fixtureScroller">
             {orderedFixtures.map((fixture) => <button key={fixture.id}
-              className={selectedFixtureIds.includes(fixture.id) ? "selected" : ""}
+              className={[
+                selectedFixtureIds.includes(fixture.id) ? "selected" : "",
+                draggedLibraryFixtureId === fixture.id ? "isDragging" : "",
+                libraryDropTarget?.fixtureId === fixture.id
+                  ? `libraryDropTarget drop-${libraryDropTarget.placement}`
+                  : "",
+              ].filter(Boolean).join(" ")}
+              draggable
               onClick={(event) => {
                 if (event.ctrlKey || event.metaKey) {
                   setSelectedFixtureIds((previous) =>
@@ -2287,6 +2621,41 @@ export default function TimelineEditor({
                   return;
                 }
                 selectSingleFixture(fixture.id);
+              }}
+              onDragStart={(event) => {
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData("text/plain", fixture.id);
+                setDraggedLibraryFixtureId(fixture.id);
+              }}
+              onDragOver={(event) => {
+                if (!draggedLibraryFixtureId || draggedLibraryFixtureId === fixture.id) return;
+                event.preventDefault();
+                event.dataTransfer.dropEffect = "move";
+                const bounds = event.currentTarget.getBoundingClientRect();
+                setLibraryDropTarget({
+                  fixtureId: fixture.id,
+                  placement:
+                    event.clientY >= bounds.top + bounds.height / 2 ? "after" : "before",
+                });
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                const draggedId =
+                  draggedLibraryFixtureId || event.dataTransfer.getData("text/plain");
+                if (draggedId) {
+                  const bounds = event.currentTarget.getBoundingClientRect();
+                  reorderFixture(
+                    draggedId,
+                    fixture.id,
+                    event.clientY >= bounds.top + bounds.height / 2 ? "after" : "before",
+                  );
+                }
+                setDraggedLibraryFixtureId(null);
+                setLibraryDropTarget(null);
+              }}
+              onDragEnd={() => {
+                setDraggedLibraryFixtureId(null);
+                setLibraryDropTarget(null);
               }}>
               <i />{fixture.name}
             </button>)}
@@ -2575,14 +2944,7 @@ export default function TimelineEditor({
                       }
                     }}
                     onChange={(data) => updateTrack(item.fixture.id, data)}
-                    onMoveFixture={(draggedId, targetId) => {
-                      setFixtureOrder((previous) => {
-                        const withoutDragged = previous.filter((id) => id !== draggedId);
-                        const targetIndex = withoutDragged.indexOf(targetId);
-                        withoutDragged.splice(Math.max(0, targetIndex), 0, draggedId);
-                        return withoutDragged;
-                      });
-                    }}
+                    onMoveFixture={reorderFixture}
                     onPan={(delta) => { if (viewportRef.current) viewportRef.current.scrollLeft -= delta; }} />
                 ) : (
                   <GroupedFixtureTrack
@@ -2637,14 +2999,7 @@ export default function TimelineEditor({
                     }}
                     onChange={(data) => updateTrack(item.group.id, data)}
                     onChildChange={(fixtureId, data) => updateTrack(fixtureId, data)}
-                    onMoveFixture={(draggedId, targetId) => {
-                      setFixtureOrder((previous) => {
-                        const withoutDragged = previous.filter((id) => id !== draggedId);
-                        const targetIndex = withoutDragged.indexOf(targetId);
-                        withoutDragged.splice(Math.max(0, targetIndex), 0, draggedId);
-                        return withoutDragged;
-                      });
-                    }}
+                    onMoveFixture={reorderFixture}
                     onPan={(delta) => { if (viewportRef.current) viewportRef.current.scrollLeft -= delta; }}
                   />
                 ))}
@@ -2668,6 +3023,8 @@ export default function TimelineEditor({
             width={contentWidth}
             visibleWidth={Math.max(0, viewportWidth - LABEL_WIDTH)}
             scroll={scrollPosition}
+            duration={duration}
+            playhead={playhead}
           />
         </section>
       </div>
@@ -2997,7 +3354,7 @@ function FixtureTrack({ fixture, data, zoom, grid, duration, width, selected, se
   beatTimes: number[];
   selected: boolean; selection: Selection | null; onSelect: () => void;
   onSelection: (selection: Selection | null) => void; onChange: (data: TrackData) => void;
-  onMoveFixture: (draggedId: string, targetId: string) => void; onPan: (delta: number) => void;
+  onMoveFixture: (draggedId: string, targetId: string, placement: "before" | "after") => void; onPan: (delta: number) => void;
   onPreviewColorChange: (color: string | null) => void;
   selectedEffectKey: string | null;
   selectedColorKey: string | null;
@@ -3044,12 +3401,17 @@ function FixtureTrack({ fixture, data, zoom, grid, duration, width, selected, se
         }
         if (!drag.dragging) return;
         event.preventDefault();
-        const targetFixtureId = document
+        const targetElement = document
           .elementFromPoint(event.clientX, event.clientY)
-          ?.closest<HTMLElement>("[data-fixture-id]")
-          ?.dataset.fixtureId;
+          ?.closest<HTMLElement>("[data-fixture-id]");
+        const targetFixtureId = targetElement?.dataset.fixtureId;
         if (targetFixtureId && targetFixtureId !== fixture.id) {
-          onMoveFixture(fixture.id, targetFixtureId);
+          const bounds = targetElement.getBoundingClientRect();
+          onMoveFixture(
+            fixture.id,
+            targetFixtureId,
+            event.clientY >= bounds.top + bounds.height / 2 ? "after" : "before",
+          );
         }
       }}
       onPointerUp={(event) => {
@@ -3187,7 +3549,7 @@ function GroupedFixtureTrack({
   onChildSelection: (fixtureId: string, selection: Selection | null) => void;
   onChange: (data: TrackData) => void;
   onChildChange: (fixtureId: string, data: TrackData) => void;
-  onMoveFixture: (draggedId: string, targetId: string) => void;
+  onMoveFixture: (draggedId: string, targetId: string, placement: "before" | "after") => void;
   onPan: (delta: number) => void;
 }) {
   if (!data) return null;
@@ -3474,7 +3836,11 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
         if (!gesture.current || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
         const deltaX = event.clientX - gesture.current.x;
         const deltaY = event.clientY - gesture.current.y;
-        if (Math.abs(deltaX) > 8 && Math.abs(deltaX) > Math.abs(deltaY)) {
+        if (
+          Math.abs(deltaX) > 3 &&
+          Math.abs(deltaX) >= Math.abs(deltaY) * 0.6
+        ) {
+          event.preventDefault();
           gesture.current.moved = true;
           onPan(deltaX);
           gesture.current.x = event.clientX;
@@ -4352,7 +4718,7 @@ const StrobeClipBlock = memo(function StrobeClipBlock({
           commit(
             clips.map((item) =>
               item.id === clip.id
-                ? { ...item, rate: Number(event.target.value) }
+                ? { ...item, rate: Number(event.target.value), endRate: Number(event.target.value) }
                 : item,
             ),
           )
@@ -4422,38 +4788,50 @@ const StrobeClipBlock = memo(function StrobeClipBlock({
   );
 });
 
-function Waveform({
+const Waveform = memo(function Waveform({
   samples,
   name,
   width,
   visibleWidth,
   scroll,
+  duration,
+  playhead,
 }: {
   samples: number[];
   name: string;
   width: number;
   visibleWidth: number;
   scroll: number;
+  duration: number;
+  playhead: number;
 }) {
   const renderWidth = Math.max(width, visibleWidth);
-  const topEdge = samples
-    .map((sample, index) => {
+  const points = useMemo(() => samples.map((sample, index) => {
       const x = samples.length > 1 ? (index / (samples.length - 1)) * 1000 : 0;
-      return `${x},${50 - sample * 45}`;
-    })
-    .join(" ");
-  const bottomEdge = [...samples]
+      const clamped = Math.min(1, Math.max(0, sample));
+      return {
+        x,
+        top: 50 - clamped * 45,
+        bottom: 50 + clamped * 45,
+      };
+    }), [samples]);
+  const topEdge = points.map(({ x, top }) => `${x},${top}`).join(" ");
+  const bottomEdge = [...points]
     .reverse()
-    .map((sample, reverseIndex) => {
-      const index = samples.length - reverseIndex - 1;
-      const x = samples.length > 1 ? (index / (samples.length - 1)) * 1000 : 0;
-      return `${x},${50 + sample * 45}`;
-    })
+    .map(({ x, bottom }) => `${x},${bottom}`)
     .join(" ");
+  const centerDetail = points
+    .map(({ x, top, bottom }) => `${x},${(top + bottom) / 2}`)
+    .join(" ");
+  const playheadX = duration > 0 ? (Math.min(duration, Math.max(0, playhead)) / duration) * 1000 : 0;
 
   return <div className="waveformDock">
-    <div className="waveformLabel"><strong>AUDIO</strong><span>{name}</span></div>
+    <div className="waveformLabel">
+      <strong>AUDIO</strong>
+      <span>{name}</span>
+    </div>
     <div className="waveformWindow">
+      <div className="waveformWindowGlow" />
       <div className="waveformBars" style={{ width: renderWidth, transform: `translateX(${-scroll}px)` }}>
         <svg
           viewBox="0 0 1000 100"
@@ -4471,13 +4849,28 @@ function Waveform({
               <stop offset=".5" stopColor="#dff6ff" stopOpacity=".34" />
               <stop offset="1" stopColor="#67caff" stopOpacity=".22" />
             </linearGradient>
+            <linearGradient id="timelineWaveformCenter" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0" stopColor="#b5ebff" stopOpacity=".06" />
+              <stop offset=".5" stopColor="#f4fbff" stopOpacity=".16" />
+              <stop offset="1" stopColor="#b5ebff" stopOpacity=".06" />
+            </linearGradient>
           </defs>
-          <polygon points={`${topEdge} ${bottomEdge}`} />
+          {[0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9].map((x) => (
+            <line key={`v-${x}`} className="waveformMinorGuide" x1={x * 1000} y1="0" x2={x * 1000} y2="100" />
+          ))}
+          <polygon className="waveformBody" points={`${topEdge} ${bottomEdge}`} />
+          <g className="waveformSampleBars">
+            {points.map(({ x, top, bottom }, index) => (
+              <line key={`sample-${index}`} x1={x} y1={top} x2={x} y2={bottom} />
+            ))}
+          </g>
+          <polyline points={centerDetail} className="waveformCenterDetail" />
           <polyline points={topEdge} className="waveformRidge" />
           <polyline points={bottomEdge} className="waveformRidge waveformRidgeBottom" />
           <line x1="0" y1="50" x2="1000" y2="50" />
+          <line className="waveformPlayheadMarker" x1={playheadX} y1="0" x2={playheadX} y2="100" />
         </svg>
       </div>
     </div>
   </div>;
-}
+});

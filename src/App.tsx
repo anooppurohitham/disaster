@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties, WheelEvent } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -7,8 +7,14 @@ import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import "./App.css";
 import TimelineEditor, {
   interpolateHexColor,
+  type TimelineHistoryState,
   type TimelineDocumentData,
 } from "./TimelineEditor";
+import {
+  createPlaceholderWaveform,
+  extractWaveformSamples,
+  getWaveformSampleCount,
+} from "./audioWaveform";
 import disasterLogo from "./assets/disaster-logo.png";
 import packageInfo from "../package.json";
 import currentReleaseNotes from "../RELEASE_NOTES.md?raw";
@@ -219,7 +225,7 @@ const RECENT_PROJECTS_STORAGE_KEY = "disaster.recentProjects.v1";
 const RECENT_AUDIO_STORAGE_KEY = "disaster.recentAudio.v1";
 const FONT_FAMILY_STORAGE_KEY = "disaster.fontFamily.v1";
 const VISUAL_EFFECTS_STORAGE_KEY = "disaster.visualEffects.v1";
-const WORKING_VERSION_SUFFIX = "";
+const WORKING_VERSION_SUFFIX = "*";
 const RECENT_FILES_DATABASE = "disaster-recent-files";
 const RECENT_FILES_STORE = "files";
 const MAX_RECENT_FILES = 6;
@@ -438,6 +444,7 @@ function App() {
   const [customModes, setCustomModes] = useState<FixtureMode[]>([]);
   const [programCustomModes, setProgramCustomModes] = useState<FixtureMode[]>([]);
   const [stageAudioSources, setStageAudioSources] = useState<Record<string, StageAudioSource | null>>({});
+  const [stageTimelineHistories, setStageTimelineHistories] = useState<Record<string, TimelineHistoryState>>({});
   const [recentProjects, setRecentProjects] = useState<RecentFileEntry[]>(() =>
     readRecentFiles(RECENT_PROJECTS_STORAGE_KEY),
   );
@@ -472,6 +479,7 @@ function App() {
     >
   >({});
   const fileMenuRef = useRef<HTMLDivElement>(null);
+  const updaterCardRef = useRef<HTMLElement>(null);
   const openInputRef = useRef<HTMLInputElement>(null);
   const saveHandleRef = useRef<any>(null);
   const lastSavedContentRef = useRef<string | null>(null);
@@ -488,6 +496,8 @@ function App() {
     },
   ]);
   const [activeFixtureId, setActiveFixtureId] = useState("front-par-1");
+  const [draggedPatchFixtureId, setDraggedPatchFixtureId] = useState<string | null>(null);
+  const [patchFixtureDropTarget, setPatchFixtureDropTarget] = useState<string | null>(null);
   const [draftFixtureName, setDraftFixtureName] = useState("Front PAR 2");
   const [draftStartAddress, setDraftStartAddress] = useState(5);
   const [draftFixtureModeId, setDraftFixtureModeId] = useState("wrgb");
@@ -632,6 +642,7 @@ function App() {
     setFixtures(nextFixtures);
     setActiveFixtureId(nextActiveFixtureId);
     setStages(nextStages);
+    setStageTimelineHistories({});
     setActiveStageId(nextActiveStageId);
     setDraftFixtureModeId(nextFixtures[0]?.modeId ?? "wrgb");
     setDraftFixtureName(`Fixture ${nextFixtures.length + 1}`);
@@ -856,14 +867,21 @@ function App() {
     }
   }
 
-  function updateActiveStageTimeline(document: TimelineDocumentData) {
+  const updateActiveStageTimeline = useCallback((document: TimelineDocumentData) => {
     if (suppressTimelineDocumentSyncRef.current) return;
     setStages((previous) =>
       previous.map((stage) =>
         stage.id === activeStageId ? { ...stage, timeline: document } : stage,
       ),
     );
-  }
+  }, [activeStageId]);
+
+  const updateActiveStageTimelineHistory = useCallback((history: TimelineHistoryState) => {
+    setStageTimelineHistories((previous) => ({
+      ...previous,
+      [activeStageId]: history,
+    }));
+  }, [activeStageId]);
 
   function pushStageUndoSnapshot() {
     stageUndoStackRef.current.push({
@@ -1065,6 +1083,7 @@ function App() {
     setCustomModeChannels(["Dimmer", "Red", "Green", "Blue", "White", "Strobe"]);
     setNextCustomChannel(COMMON_CHANNEL_PRESETS[0]);
     setStages([{ id: "stage-1", name: "Stage 1", timeline: null, plot2d: [] }]);
+    setStageTimelineHistories({});
     setActiveStageId("stage-1");
     setStatus("Started a new project.");
     setIsDirty(false);
@@ -1143,6 +1162,19 @@ function App() {
     } finally {
       setCheckingForUpdates(false);
     }
+  }
+
+  function openUpdaterSection() {
+    setPage("app");
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        updaterCardRef.current?.scrollIntoView({
+          behavior: "smooth",
+          block: "center",
+        });
+        updaterCardRef.current?.focus({ preventScroll: true });
+      });
+    });
   }
 
   async function installAvailableUpdate() {
@@ -1325,6 +1357,45 @@ function deleteFixture(fixtureId: string) {
   }
 
   setStatus("Fixture removed.");
+}
+
+function reorderPatchedFixture(
+  draggedId: string,
+  targetId: string,
+  placement: "before" | "after",
+) {
+  if (draggedId === targetId) return;
+
+  const reorderIds = (ids: string[]) => {
+    const withoutDragged = ids.filter((id) => id !== draggedId);
+    const targetIndex = withoutDragged.indexOf(targetId);
+    if (targetIndex < 0) return ids;
+    const next = [...withoutDragged];
+    next.splice(placement === "after" ? targetIndex + 1 : targetIndex, 0, draggedId);
+    return next;
+  };
+
+  setFixtures((previous) => {
+    const byId = new Map(previous.map((fixture) => [fixture.id, fixture]));
+    return reorderIds(previous.map((fixture) => fixture.id))
+      .map((fixtureId) => byId.get(fixtureId))
+      .filter((fixture): fixture is PatchedFixture => Boolean(fixture));
+  });
+  setStages((previous) =>
+    previous.map((stage) =>
+      stage.timeline
+        ? {
+            ...stage,
+            timeline: {
+              ...stage.timeline,
+              fixtureOrder: reorderIds(stage.timeline.fixtureOrder),
+            },
+          }
+        : stage,
+    ),
+  );
+  setIsDirty(true);
+  setStatus("Fixture order updated.");
 }
 
 function updateFixtureStartAddress(fixtureId: string, startAddress: number) {
@@ -1695,7 +1766,11 @@ function clearFixture(fixture: PatchedFixture) {
         latestTimelineOutputRef.current,
         previewColorRef.current,
       );
-      setChannels(next);
+      // Keep native color-picker dragging responsive. DMX still receives every
+      // throttled preview; the React channel display catches up when preview ends.
+      if (previewColorRef.current === null) {
+        setChannels(next);
+      }
       queueSend(next);
     });
   }
@@ -1937,6 +2012,18 @@ function clearFixture(fixture: PatchedFixture) {
         </div>
 
         <div className="headerControls">
+          {updateAvailability === "available" && availableUpdate ? (
+            <button
+              type="button"
+              className="headerUpdateAvailable"
+              onClick={openUpdaterSection}
+              title={`Disaster ${availableUpdate.version} is available`}
+            >
+              <span aria-hidden="true">↑</span>
+              <strong>Update available</strong>
+              <small>{availableUpdate.version}</small>
+            </button>
+          ) : null}
           <button className="blackoutHeaderButton" onClick={() => void blackout()}>
             Blackout
           </button>
@@ -2087,7 +2174,12 @@ function clearFixture(fixture: PatchedFixture) {
             </label>
           </article>
 
-          <article className="appInfoCard appUpdaterCard">
+          <article
+            ref={updaterCardRef}
+            className="appInfoCard appUpdaterCard"
+            tabIndex={-1}
+            aria-live="polite"
+          >
             <div className="appInfoCardHeader">
               <div>
                 <small>UPDATE STATUS</small>
@@ -2575,7 +2667,7 @@ function clearFixture(fixture: PatchedFixture) {
             return (
               <div
                 key={fixture.id}
-                className={`fixtureListItem ${isActive ? "activeFixture" : ""}`}
+                className={`fixtureListItem ${isActive ? "activeFixture" : ""} ${patchFixtureDropTarget === fixture.id ? "fixtureDropTarget" : ""}`}
                 role="button"
                 tabIndex={0}
                 aria-pressed={isActive}
@@ -2586,7 +2678,54 @@ function clearFixture(fixture: PatchedFixture) {
                     setActiveFixtureId(fixture.id);
                   }
                 }}
+                onDragOver={(event) => {
+                  if (!draggedPatchFixtureId || draggedPatchFixtureId === fixture.id) return;
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = "move";
+                  setPatchFixtureDropTarget(fixture.id);
+                }}
+                onDragLeave={(event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                    setPatchFixtureDropTarget((current) =>
+                      current === fixture.id ? null : current,
+                    );
+                  }
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  const draggedId =
+                    draggedPatchFixtureId || event.dataTransfer.getData("text/plain");
+                  if (draggedId) {
+                    const bounds = event.currentTarget.getBoundingClientRect();
+                    reorderPatchedFixture(
+                      draggedId,
+                      fixture.id,
+                      event.clientY >= bounds.top + bounds.height / 2 ? "after" : "before",
+                    );
+                  }
+                  setDraggedPatchFixtureId(null);
+                  setPatchFixtureDropTarget(null);
+                }}
               >
+                <span
+                  className="fixtureDragHandle"
+                  draggable
+                  title={`Drag to reorder ${fixture.name}`}
+                  aria-label={`Drag to reorder ${fixture.name}`}
+                  onClick={(event) => event.stopPropagation()}
+                  onDragStart={(event) => {
+                    event.stopPropagation();
+                    event.dataTransfer.effectAllowed = "move";
+                    event.dataTransfer.setData("text/plain", fixture.id);
+                    setDraggedPatchFixtureId(fixture.id);
+                  }}
+                  onDragEnd={() => {
+                    setDraggedPatchFixtureId(null);
+                    setPatchFixtureDropTarget(null);
+                  }}
+                >
+                  {String.fromCharCode(0x28ff)}
+                </span>
                 <div>
                   <strong>{fixture.name}</strong>
                   <span>
@@ -2698,6 +2837,7 @@ function clearFixture(fixture: PatchedFixture) {
           requestedAudioFile={requestedAudioFile}
           onRequestedAudioHandled={() => setRequestedAudioFile(null)}
           initialDocumentState={activeStage?.timeline ?? null}
+          initialHistoryState={stageTimelineHistories[activeStage?.id ?? "stage-1"] ?? null}
           stagePlacements={activeStage?.plot2d ?? []}
           stages={stages.map((stage) => ({ id: stage.id, name: stage.name }))}
           activeStageId={activeStage?.id ?? "stage-1"}
@@ -2707,6 +2847,7 @@ function clearFixture(fixture: PatchedFixture) {
           onRemoveStage={removeStage}
           volume={sharedVolume}
           onVolumeChange={setSharedVolume}
+          onHistoryStateChange={updateActiveStageTimelineHistory}
         />
       ) : (
         <StageView
@@ -3638,9 +3779,7 @@ export function LegacyTimelineEditor({ fixtures }: { fixtures: PatchedFixture[] 
   const [duration, setDuration] = useState(60);
   const [audioName, setAudioName] = useState("");
   const [waveform, setWaveform] = useState<number[]>(
-    Array.from({ length: 160 }, (_, index) =>
-      0.18 + Math.abs(Math.sin(index * 0.41) * Math.cos(index * 0.13)) * 0.72,
-    ),
+    createPlaceholderWaveform(160),
   );
   const timelineWidth = Math.max(1200, duration * zoom);
 
@@ -3650,19 +3789,7 @@ export function LegacyTimelineEditor({ fixtures }: { fixtures: PatchedFixture[] 
       const context = new AudioContext();
       const buffer = await context.decodeAudioData(await file.arrayBuffer());
       setDuration(Math.max(10, Math.ceil(buffer.duration)));
-      const data = buffer.getChannelData(0);
-      const sampleCount = 400;
-      const bucketSize = Math.max(1, Math.floor(data.length / sampleCount));
-      const peaks = Array.from({ length: sampleCount }, (_, bucket) => {
-        let peak = 0;
-        const start = bucket * bucketSize;
-        const end = Math.min(data.length, start + bucketSize);
-        for (let index = start; index < end; index += 1) {
-          peak = Math.max(peak, Math.abs(data[index]));
-        }
-        return Math.max(0.04, peak);
-      });
-      setWaveform(peaks);
+      setWaveform(extractWaveformSamples(buffer, getWaveformSampleCount(buffer.duration)));
       await context.close();
     } catch {
       setAudioName(`${file.name} (preview unavailable)`);
