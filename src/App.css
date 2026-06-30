@@ -1,9 +1,15 @@
 .appShell {
+  --app-font-family: Inter, ui-sans-serif, system-ui, sans-serif;
   min-height: 100vh;
   background: #0d0f12;
   color: #e8ebef;
   -webkit-user-select: none;
   user-select: none;
+}
+
+.appShell,
+.appShell * {
+  font-family: var(--app-font-family);
 }
 
 body {
@@ -512,6 +518,196 @@ select {
   margin: 6px 0 0;
 }
 
+.appAppearanceCard {
+  align-content: start;
+}
+
+.appUpdaterCard {
+  align-content: start;
+  gap: 12px;
+}
+
+.appUpdaterSummary {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.appUpdaterSummary p {
+  margin: 0;
+  color: #aab5c2;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.appUpdaterChanges {
+  display: grid;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid #29323d;
+}
+
+.appUpdaterChanges > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.appUpdaterChanges small {
+  color: #7f8a98;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .12em;
+}
+
+.appUpdaterChanges span {
+  color: #8290a0;
+  font-size: 10px;
+}
+
+.appUpdaterChanges ul {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding-left: 18px;
+  color: #d9e0e8;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.appUpdaterChanges li::marker {
+  color: #5f9eef;
+}
+
+.appAppearanceSetting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 13px 14px;
+  background: rgb(10 13 18 / 66%);
+  border: 1px solid #27313d;
+  border-radius: 12px;
+}
+
+.appAppearanceSetting > span {
+  display: grid;
+  gap: 4px;
+}
+
+.appAppearanceSetting strong {
+  color: #eef3f8;
+  font-size: 13px;
+}
+
+.appAppearanceSetting small {
+  color: #83909f;
+  line-height: 1.35;
+}
+
+.appAppearanceSetting select {
+  min-width: 145px;
+  padding: 8px 10px;
+  color: #e8edf3;
+  background: #161b22;
+  border: 1px solid #35404d;
+  border-radius: 8px;
+}
+
+.appAppearanceToggle input {
+  width: 38px;
+  height: 20px;
+  flex: none;
+  accent-color: #3185ff;
+}
+
+.appShell.effectsDisabled *,
+.appShell.effectsDisabled *::before,
+.appShell.effectsDisabled *::after {
+  background-image: none !important;
+  box-shadow: none !important;
+  filter: none !important;
+  text-shadow: none !important;
+}
+
+.appShell.effectsDisabled .blackoutHeaderButton {
+  background-color: #761c19;
+}
+
+.appShell.effectsDisabled .curveArea {
+  fill: none !important;
+}
+
+.appShell.effectsDisabled .curveBackdrop {
+  display: none;
+}
+
+.appShell.effectsDisabled .intensityPath {
+  fill: none !important;
+  stroke: #fff;
+}
+
+.appShell.effectsDisabled .timelineV2 .waveformBars polygon {
+  fill: #67bfe9;
+}
+
+.appShell.effectsDisabled .timelineV2 .waveformBars line {
+  stroke: #67bfe9;
+}
+
+.appShell.effectsDisabled .appInfoPage {
+  background-color: #0d0f12;
+}
+
+.appShell.effectsDisabled .appInfoHero,
+.appShell.effectsDisabled .appRecentPanel,
+.appShell.effectsDisabled .appInfoCard,
+.appShell.effectsDisabled .card {
+  background-color: #151a21;
+}
+
+.appShell.effectsDisabled .stageFixtureCone {
+  background-image:
+    radial-gradient(
+      ellipse at 50% 100%,
+      color-mix(in srgb, var(--beam-color, #8ab6ff) 85%, white) 0%,
+      color-mix(in srgb, var(--beam-color, #8ab6ff) 72%, white) 24%,
+      color-mix(in srgb, var(--beam-color, #8ab6ff) 46%, transparent) 58%,
+      transparent 100%
+    ) !important;
+  filter: blur(8px) saturate(118%) !important;
+}
+
+.appShell.effectsDisabled .danceStageFrame {
+  background-image:
+    linear-gradient(rgb(255 255 255 / 4%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(255 255 255 / 4%) 1px, transparent 1px) !important;
+}
+
+.appShell.effectsDisabled .stageMiniWaveformBars i {
+  background-image:
+    linear-gradient(
+      180deg,
+      #6ed8ff,
+      rgb(110 216 255 / 18%)
+    ) !important;
+  box-shadow: 0 0 8px rgb(110 216 255 / 15%) !important;
+}
+
+.appShell.effectsDisabled .colorTransitionBlock {
+  background-image:
+    linear-gradient(
+      90deg,
+      var(--transition-from),
+      var(--transition-to)
+    ) !important;
+  box-shadow:
+    inset 0 0 0 1px rgb(0 0 0 / 20%),
+    0 0 12px rgb(106 165 255 / 22%) !important;
+  text-shadow: 0 1px 2px #000 !important;
+}
+
 .appInfoActionButton {
   flex: none;
   padding: 9px 14px;
@@ -866,7 +1062,8 @@ select {
   justify-content: space-between;
   gap: 12px;
   width: 100%;
-  padding: 0;
+  padding: 12px 14px;
+  box-sizing: border-box;
   color: #dce2e9;
   text-align: left;
   background: transparent;
@@ -1110,7 +1307,48 @@ select {
 .fixtureList {
   display: grid;
   gap: 10px;
-  margin-top: 16px;
+}
+
+.currentFixturesSection {
+  margin-top: 38px;
+  padding-top: 24px;
+  border-top: 1px solid #39424e;
+}
+
+.currentFixturesHeader {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 16px;
+}
+
+.currentFixturesHeader > div {
+  display: grid;
+  gap: 5px;
+}
+
+.currentFixturesHeader small {
+  color: #788594;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .12em;
+}
+
+.currentFixturesHeader h3 {
+  margin: 0;
+  color: #eef2f7;
+  font-size: 19px;
+}
+
+.currentFixturesHeader > span {
+  padding: 5px 9px;
+  color: #aeb9c6;
+  background: #171d25;
+  border: 1px solid #303a46;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .fixtureListItem {
@@ -2221,7 +2459,8 @@ select {
   position: relative;
   min-height: 0;
   padding: 0;
-  overscroll-behavior: contain;
+  overscroll-behavior: none;
+  overscroll-behavior-x: none;
   scrollbar-color: #4b5665 #11151a;
   scrollbar-width: auto;
 }
@@ -3316,7 +3555,7 @@ select {
   grid-template-columns: 270px minmax(0, 1fr);
   gap: 18px;
   padding: 20px 24px;
-  padding-bottom: 24px;
+  padding-bottom: calc(var(--stage-overview-height) + 24px);
   overflow: hidden;
 }
 
@@ -3460,7 +3699,7 @@ select {
 
 .danceStageGrid {
   position: absolute;
-  top: calc(50% - (var(--stage-overview-height) / 2));
+  top: 50%;
   left: 50%;
   display: grid;
   width: 1180px;
@@ -3502,6 +3741,41 @@ select {
   font-weight: 800;
   letter-spacing: .12em;
   text-transform: uppercase;
+}
+
+.stageDirectionLabel {
+  position: absolute;
+  z-index: 5;
+  color: #9db0c6;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: .18em;
+  pointer-events: none;
+  text-shadow: 0 1px 5px #090b0e;
+}
+
+.stageDirectionFront {
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.stageDirectionBack {
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.stageDirectionLeft {
+  top: 50%;
+  left: 10px;
+  transform: translateY(-50%) rotate(-90deg);
+}
+
+.stageDirectionRight {
+  top: 50%;
+  right: 10px;
+  transform: translateY(-50%) rotate(90deg);
 }
 
 .stageFixtureBlock {

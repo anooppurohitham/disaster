@@ -71,11 +71,45 @@ fn list_serial_ports() -> Result<Vec<SerialPortDto>, String> {
 
     Ok(ports
         .into_iter()
+        .filter(is_supported_dmx_port)
         .map(|p| SerialPortDto {
             port_name: p.port_name,
             port_type: format!("{:?}", p.port_type),
         })
         .collect())
+}
+
+fn is_supported_dmx_port(port: &serialport::SerialPortInfo) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let name = port.port_name.to_ascii_lowercase();
+
+        // macOS exposes each serial device through both /dev/tty.* and
+        // /dev/cu.*. DMX output should use the callout device, so hide the
+        // duplicate tty entry along with built-in virtual/system ports.
+        if !name.starts_with("/dev/cu.")
+            || name.contains("bluetooth")
+            || name.contains("debug")
+            || name.contains("console")
+            || name.contains("wireless")
+            || name.contains("iphone")
+            || name.contains("ipad")
+        {
+            return false;
+        }
+
+        return matches!(&port.port_type, serialport::SerialPortType::UsbPort(_))
+            || name.contains("usbserial")
+            || name.contains("usbmodem")
+            || name.contains("slab_usbtouart")
+            || name.contains("wchusbserial");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = port;
+        true
+    }
 }
 
 #[tauri::command]
@@ -509,6 +543,8 @@ pub fn run() {
 
             Ok(())
         })
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .manage(dmx_state)
         .invoke_handler(tauri::generate_handler![

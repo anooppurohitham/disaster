@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, WheelEvent } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { confirm, open, save } from "@tauri-apps/plugin-dialog";
+import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import "./App.css";
 import TimelineEditor, {
   interpolateHexColor,
@@ -213,6 +215,15 @@ const COMMON_CHANNEL_PRESETS = [
 const PROGRAM_CUSTOM_MODES_STORAGE_KEY = "disaster.programCustomFixtureModes.v1";
 const RECENT_PROJECTS_STORAGE_KEY = "disaster.recentProjects.v1";
 const RECENT_AUDIO_STORAGE_KEY = "disaster.recentAudio.v1";
+const FONT_FAMILY_STORAGE_KEY = "disaster.fontFamily.v1";
+const VISUAL_EFFECTS_STORAGE_KEY = "disaster.visualEffects.v1";
+const RECENT_UPDATE_CHANGES = [
+  "Native Open, Save, and Save As support on macOS",
+  "Command-key shortcuts and smoother timeline scrolling on Mac",
+  "Stage orientation labels and unobstructed fixture rotation controls",
+  "Improved intensity waypoint and horizontal-section editing",
+  "Appearance controls for fonts, glows, and gradients",
+];
 const RECENT_FILES_DATABASE = "disaster-recent-files";
 const RECENT_FILES_STORE = "files";
 const MAX_RECENT_FILES = 6;
@@ -364,8 +375,28 @@ function normalizeStageName(value: string) {
   return value.trim().toLowerCase();
 }
 
+function updateChangeList(body?: string | null) {
+  const changes = (body ?? "")
+    .split(/\r?\n/)
+    .map((line) =>
+      line
+        .trim()
+        .replace(/^[-*•]\s+/, "")
+        .replace(/^\d+[.)]\s+/, "")
+        .replace(/^#+\s*/, ""),
+    )
+    .filter((line) => line.length > 0 && line.toLowerCase() !== "changes");
+  return changes.length ? changes.slice(0, 6) : RECENT_UPDATE_CHANGES;
+}
+
 function App() {
   const [page, setPage] = useState<"app" | "patch" | "timeline" | "stage">("app");
+  const [fontFamily, setFontFamily] = useState(
+    () => localStorage.getItem(FONT_FAMILY_STORAGE_KEY) ?? "system",
+  );
+  const [visualEffectsEnabled, setVisualEffectsEnabled] = useState(
+    () => localStorage.getItem(VISUAL_EFFECTS_STORAGE_KEY) !== "false",
+  );
   const [ports, setPorts] = useState<SerialPortDto[]>([]);
   const [artNetNodes, setArtNetNodes] = useState<ArtNetNodeDto[]>([]);
   const [artNetEnabled, setArtNetEnabled] = useState(
@@ -680,6 +711,27 @@ function App() {
   }
 
   async function openProject() {
+    if (isTauri()) {
+      try {
+        const path = await open({
+          multiple: false,
+          directory: false,
+          filters: [{ name: "Disaster Timeline Show", extensions: ["dstr"] }],
+        });
+        if (!path || Array.isArray(path)) return;
+        const text = await readTextFile(path);
+        const filename = path.split(/[\\/]/).pop() ?? "project.dstr";
+        const file = new File([text], filename, {
+          type: "application/x-disaster-show",
+        });
+        await openProjectFromFile(file, path);
+      } catch (err) {
+        setStatus(`Open error: ${String(err)}`);
+        setFileMenuOpen(false);
+      }
+      return;
+    }
+
     const picker = (window as Window & {
       showOpenFilePicker?: (options: unknown) => Promise<any[]>;
     }).showOpenFilePicker;
@@ -878,6 +930,10 @@ function App() {
   }
 
   async function writeDocumentToHandle(handle: any, content: string) {
+    if (typeof handle === "string") {
+      await writeTextFile(handle, content);
+      return;
+    }
     const writable = await handle.createWritable();
     await writable.write(content);
     await writable.close();
@@ -906,6 +962,24 @@ function App() {
         setIsDirty(false);
         setStatus(`Saved ${documentName}.`);
         setFileMenuOpen(false);
+        return;
+      }
+
+      if (isTauri()) {
+        const path = await save({
+          defaultPath: ensureDstrFilename(documentName),
+          filters: [{ name: "Disaster Timeline Show", extensions: ["dstr"] }],
+        });
+        if (!path) return;
+        const filename = ensureDstrFilename(
+          path.split(/[\\/]/).pop() ?? documentName,
+        );
+        await writeTextFile(path, content);
+        saveHandleRef.current = path;
+        lastSavedContentRef.current = content;
+        setIsDirty(false);
+        setDocumentName(filename);
+        setStatus(`Saved ${filename}.`);
         return;
       }
 
@@ -946,9 +1020,15 @@ function App() {
     }
   }
 
-  function newProject() {
-    if (isDirty && !window.confirm("Discard the current unsaved project and start a new one?")) {
-      return;
+  async function newProject() {
+    if (isDirty) {
+      const shouldDiscard = isTauri()
+        ? await confirm("Discard the current unsaved project and start a new one?", {
+            title: "New project",
+            kind: "warning",
+          })
+        : window.confirm("Discard the current unsaved project and start a new one?");
+      if (!shouldDiscard) return;
     }
 
     resetRuntimeProjectSession();
@@ -1692,7 +1772,13 @@ function clearFixture(fixture: PatchedFixture) {
 
       if (primaryModifier && key === "s") {
         event.preventDefault();
-        void saveShow(false);
+        void saveShow(event.shiftKey);
+        return;
+      }
+
+      if (primaryModifier && key === "n") {
+        event.preventDefault();
+        void newProject();
         return;
       }
 
@@ -1730,7 +1816,17 @@ function clearFixture(fixture: PatchedFixture) {
   }, []);
 
   return (
-    <div className="appShell">
+    <div
+      className={`appShell ${visualEffectsEnabled ? "" : "effectsDisabled"}`}
+      style={
+        {
+          "--app-font-family":
+            fontFamily === "system"
+              ? "Inter, ui-sans-serif, system-ui, sans-serif"
+              : fontFamily,
+        } as CSSProperties
+      }
+    >
       <header className="appHeader">
         <input
           ref={openInputRef}
@@ -1907,7 +2003,53 @@ function clearFixture(fixture: PatchedFixture) {
         </section>
 
         <section className="appInfoGrid">
-          <article className="appInfoCard">
+          <article className="appInfoCard appAppearanceCard">
+            <div className="appInfoCardHeader">
+              <div>
+                <small>APPEARANCE</small>
+                <h2>Interface</h2>
+              </div>
+            </div>
+            <label className="appAppearanceSetting">
+              <span>
+                <strong>Font family</strong>
+                <small>Used throughout the application</small>
+              </span>
+              <select
+                value={fontFamily}
+                onChange={(event) => {
+                  const next = event.target.value;
+                  setFontFamily(next);
+                  localStorage.setItem(FONT_FAMILY_STORAGE_KEY, next);
+                }}
+              >
+                <option value="system">System</option>
+                <option value="Arial, sans-serif">Arial</option>
+                <option value="Helvetica, Arial, sans-serif">Helvetica</option>
+                <option value="Verdana, sans-serif">Verdana</option>
+                <option value="Georgia, serif">Georgia</option>
+                <option value="'Times New Roman', serif">Times New Roman</option>
+                <option value="'Courier New', monospace">Courier New</option>
+              </select>
+            </label>
+            <label className="appAppearanceSetting appAppearanceToggle">
+              <span>
+                <strong>Glow &amp; gradients</strong>
+                <small>Graph underglow, shadows, gradients, and illuminated accents</small>
+              </span>
+              <input
+                type="checkbox"
+                checked={visualEffectsEnabled}
+                onChange={(event) => {
+                  const next = event.target.checked;
+                  setVisualEffectsEnabled(next);
+                  localStorage.setItem(VISUAL_EFFECTS_STORAGE_KEY, String(next));
+                }}
+              />
+            </label>
+          </article>
+
+          <article className="appInfoCard appUpdaterCard">
             <div className="appInfoCardHeader">
               <div>
                 <small>UPDATE STATUS</small>
@@ -1921,38 +2063,37 @@ function clearFixture(fixture: PatchedFixture) {
                 {checkingForUpdates ? "Checking..." : "Check now"}
               </button>
             </div>
-            <div className={`appInfoStatusBadge status-${updateAvailability}`}>
-              {updateAvailability === "idle"
-                ? "Not checked yet"
-                : updateAvailability === "checking"
-                  ? "Checking"
-                  : updateAvailability === "upToDate"
-                    ? "Up to date"
-                    : updateAvailability === "available"
-                      ? "Update available"
-                      : updateAvailability === "notConfigured"
-                        ? "Not configured"
-                        : "Update error"}
-            </div>
-            <p>{updateStatusDetail}</p>
-            {availableUpdate ? (
-              <div className="appInfoMetaList">
-                <div>
-                  <span>Available version</span>
-                  <strong>{availableUpdate.version}</strong>
-                </div>
-                <div>
-                  <span>Current version</span>
-                  <strong>{availableUpdate.currentVersion}</strong>
-                </div>
-                {availableUpdate.date ? (
-                  <div>
-                    <span>Published</span>
-                    <strong>{availableUpdate.date}</strong>
-                  </div>
-                ) : null}
+            <div className="appUpdaterSummary">
+              <div className={`appInfoStatusBadge status-${updateAvailability}`}>
+                {updateAvailability === "idle"
+                  ? "Not checked yet"
+                  : updateAvailability === "checking"
+                    ? "Checking"
+                    : updateAvailability === "upToDate"
+                      ? "Up to date"
+                      : updateAvailability === "available"
+                        ? "Update available"
+                        : updateAvailability === "notConfigured"
+                          ? "Not configured"
+                          : "Update error"}
               </div>
-            ) : null}
+              <p>{updateStatusDetail}</p>
+            </div>
+            <div className="appUpdaterChanges">
+              <div>
+                <small>RECENT CHANGES</small>
+                <span>
+                  {availableUpdate
+                    ? `Version ${availableUpdate.version}`
+                    : `Version ${packageInfo.version}`}
+                </span>
+              </div>
+              <ul>
+                {updateChangeList(availableUpdate?.body).map((change) => (
+                  <li key={change}>{change}</li>
+                ))}
+              </ul>
+            </div>
           </article>
 
           <article className="appInfoCard">
@@ -2356,8 +2497,17 @@ function clearFixture(fixture: PatchedFixture) {
           </div>
         ) : null}
 
-        <div className="fixtureList">
-          {fixtures.map((fixture) => {
+        <section className="currentFixturesSection">
+          <div className="currentFixturesHeader">
+            <div>
+              <small>PATCHED TO THIS PROJECT</small>
+              <h3>Current fixtures</h3>
+            </div>
+            <span>{fixtures.length} fixture{fixtures.length === 1 ? "" : "s"}</span>
+          </div>
+
+          <div className="fixtureList">
+            {fixtures.map((fixture) => {
             const mode = getFixtureMode(fixture.modeId);
             const endAddress = getFixtureEndAddress(fixture);
             const isActive = fixture.id === activeFixtureId;
@@ -2422,8 +2572,9 @@ function clearFixture(fixture: PatchedFixture) {
                 </button>
               </div>
             );
-          })}
-        </div>
+            })}
+          </div>
+        </section>
       </section>
 
       <section className="card">
@@ -3141,7 +3292,7 @@ function StageView({
           </div>
           <div className="stageFixtureControls">
             <label>
-              Projection direction
+              Rotation / projection direction
               <select
                 value={selectedPlacedFixture?.direction ?? "front"}
                 disabled={!selectedPlacedFixture}
@@ -3254,6 +3405,10 @@ function StageView({
                   } as React.CSSProperties
                 }
               >
+                <span className="stageDirectionLabel stageDirectionFront">FRONT</span>
+                <span className="stageDirectionLabel stageDirectionBack">BACK</span>
+                <span className="stageDirectionLabel stageDirectionLeft">LEFT</span>
+                <span className="stageDirectionLabel stageDirectionRight">RIGHT</span>
                 {plotFixtures.map((placed) => {
                   const fixture = fixtures.find((item) => item.id === placed.fixtureId);
                   if (!fixture) return null;

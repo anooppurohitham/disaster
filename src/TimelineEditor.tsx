@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState, type CSSProperties } from "react";
 import { getFixtureMode, type PatchedFixture } from "./App";
 
 type Point = { time: number; value: number };
@@ -716,7 +716,6 @@ export default function TimelineEditor({
   const [playing, setPlaying] = useState(false);
   const [transportLockEnabled, setTransportLockEnabled] = useState(false);
   const [stopArmed, setStopArmed] = useState(false);
-  const [ctrlHeld, setCtrlHeld] = useState(false);
   const [fixtureOrder, setFixtureOrder] = useState<string[]>(
     initialDocumentState?.fixtureOrder ?? fixtures.map((fixture) => fixture.id),
   );
@@ -2046,7 +2045,15 @@ export default function TimelineEditor({
   }
 
   function handleViewportScroll(event: React.UIEvent<HTMLDivElement>) {
-    const nextScroll = event.currentTarget.scrollLeft;
+    const viewport = event.currentTarget;
+    const maximumScroll = Math.max(0, viewport.scrollWidth - viewport.clientWidth);
+    // WebKit can report negative or beyond-the-end scroll offsets during its
+    // rubber-band animation. Keep the fixed fixture-name pane pinned to the
+    // real scrollable range instead of letting it follow that overscroll.
+    const nextScroll = Math.min(
+      maximumScroll,
+      Math.max(0, viewport.scrollLeft),
+    );
     event.currentTarget.style.setProperty("--track-scroll", `${nextScroll}px`);
     pendingScrollRef.current = nextScroll;
     if (scrollRafRef.current !== null) return;
@@ -2058,7 +2065,6 @@ export default function TimelineEditor({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      setCtrlHeld(event.ctrlKey);
       const key = event.key.toLowerCase();
       const primaryModifier = event.ctrlKey || event.metaKey;
       const target = event.target;
@@ -2104,12 +2110,9 @@ export default function TimelineEditor({
         }
       }
     };
-    const onKeyUp = (event: KeyboardEvent) => setCtrlHeld(event.ctrlKey);
     window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
     };
   }, [transportLockEnabled, selections, clipboard, selectedFixtureId, playhead, playing, duration, tracks]);
 
@@ -2358,7 +2361,13 @@ export default function TimelineEditor({
             onScroll={handleViewportScroll}
             onWheelCapture={handleTimelineWheel}
             onPointerDownCapture={(event) => {
-              if (selectionGestureRef.current || !selections.length || selectionMode || event.ctrlKey) return;
+              if (
+                selectionGestureRef.current ||
+                !selections.length ||
+                selectionMode ||
+                event.ctrlKey ||
+                event.metaKey
+              ) return;
               const viewport = viewportRef.current;
               if (!viewport) return;
               const bounds = viewport.getBoundingClientRect();
@@ -2402,7 +2411,7 @@ export default function TimelineEditor({
                 onChange={setBeatgrid}
               />
               <div ref={fixtureTracksRef} className="fixtureTracks">
-                {selectionMode || ctrlHeld ? (
+                {selectionMode ? (
                   <div
                     className="multiFixtureSelectionOverlay"
                     onPointerDown={(event) => {
@@ -3193,6 +3202,18 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
 }) {
   const svgRef = useRef<SVGSVGElement>(null);
   const gesture = useRef<{ x: number; y: number; moved: boolean } | null>(null);
+  const waypointDrag = useRef<{ point: Point; timeOffset: number } | null>(
+    null,
+  );
+  const segmentDrag = useRef<{
+    orientation: "horizontal" | "vertical";
+    leftIndex: number;
+    rightIndex: number;
+    startX: number;
+    startY: number;
+    startTime: number;
+    startValue: number;
+  } | null>(null);
   const sorted = [...data.points].sort((a, b) => a.time - b.time);
   const activeSplineEffect = selectedEffectKey
     ? data.effects.find(
@@ -3268,10 +3289,97 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
     </div>
     <svg ref={svgRef} className="curveSvg" width={width} height="150"
       onPointerDown={(event) => {
+        if (event.ctrlKey || event.metaKey) {
+          const bounds = svgRef.current?.getBoundingClientRect();
+          if (bounds) {
+            const pointerTime = Math.min(
+              duration,
+              Math.max(0, (event.clientX - bounds.left) / zoom),
+            );
+            const pointerValue = Math.min(
+              1,
+              Math.max(0, 1 - (event.clientY - bounds.top) / bounds.height),
+            );
+            const horizontalSegment = sorted.slice(0, -1).find((left, index) => {
+              const right = sorted[index + 1];
+              return (
+                Math.abs(left.value - right.value) < 0.001 &&
+                pointerTime >= left.time &&
+                pointerTime <= right.time &&
+                Math.abs(pointerValue - left.value) * bounds.height <= 12
+              );
+            });
+            const verticalSegment = sorted.slice(0, -1).find((left, index) => {
+              const right = sorted[index + 1];
+              return (
+                Math.abs(left.time - right.time) < 0.001 &&
+                Math.abs(pointerTime - left.time) * zoom <= 12 &&
+                pointerValue >= Math.min(left.value, right.value) &&
+                pointerValue <= Math.max(left.value, right.value)
+              );
+            });
+            const segment = horizontalSegment ?? verticalSegment;
+            if (segment) {
+              const sortedIndex = sorted.indexOf(segment);
+              const orientation = horizontalSegment ? "horizontal" : "vertical";
+              if (!(orientation === "vertical" && sortedIndex === 0)) {
+                event.preventDefault();
+                segmentDrag.current = {
+                  orientation,
+                  leftIndex: data.points.indexOf(segment),
+                  rightIndex: data.points.indexOf(sorted[sortedIndex + 1]),
+                  startX: event.clientX,
+                  startY: event.clientY,
+                  startTime: segment.time,
+                  startValue: segment.value,
+                };
+                event.currentTarget.setPointerCapture(event.pointerId);
+                return;
+              }
+            }
+          }
+        }
         gesture.current = { x: event.clientX, y: event.clientY, moved: false };
         event.currentTarget.setPointerCapture(event.pointerId);
       }}
       onPointerMove={(event) => {
+        const drag = segmentDrag.current;
+        if (drag && event.currentTarget.hasPointerCapture(event.pointerId)) {
+          if (drag.orientation === "vertical") {
+            const nextTime = Math.min(
+              duration,
+              Math.max(
+                0,
+                snap(
+                  drag.startTime + (event.clientX - drag.startX) / zoom,
+                  grid,
+                ),
+              ),
+            );
+            onChange({
+              ...data,
+              points: data.points.map((item, index) =>
+                index === drag.leftIndex || index === drag.rightIndex
+                  ? { ...item, time: nextTime }
+                  : item,
+              ),
+            });
+          } else {
+            const nextValue = Math.min(
+              1,
+              Math.max(0, drag.startValue - (event.clientY - drag.startY) / 150),
+            );
+            onChange({
+              ...data,
+              points: data.points.map((item, index) =>
+                index === drag.leftIndex || index === drag.rightIndex
+                  ? { ...item, value: nextValue }
+                  : item,
+              ),
+            });
+          }
+          return;
+        }
         if (!gesture.current || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
         const deltaX = event.clientX - gesture.current.x;
         const deltaY = event.clientY - gesture.current.y;
@@ -3283,6 +3391,13 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
         }
       }}
       onPointerUp={(event) => {
+        if (segmentDrag.current) {
+          segmentDrag.current = null;
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }
+          return;
+        }
         if (gesture.current && !gesture.current.moved) {
           const point = toPoint(event.clientX, event.clientY);
           if (
@@ -3310,16 +3425,147 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
       </defs>
       <path className="curveArea" d={`${path} L ${(sorted[sorted.length - 1]?.time ?? 0) * zoom} 150 L 0 150 Z`} />
       <path className="curveBackdrop" d={path} />
-      <path className="intensityPath" d={path} />
-      {sorted.map((point, index) => <circle className="waypoint" key={index} cx={point.time * zoom} cy={(1 - point.value) * 150} r="6"
-        onPointerDown={(event) => { event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); }}
+      <path
+        className="intensityPath"
+        d={path}
+        onPointerDown={(event) => {
+          if (!event.ctrlKey && !event.metaKey) return;
+          const point = toPoint(event.clientX, event.clientY);
+          if (!point) return;
+          const horizontalSegment = sorted.slice(0, -1).find((left, index) => {
+            const right = sorted[index + 1];
+            return (
+              Math.abs(left.value - right.value) < 0.001 &&
+              point.time >= left.time &&
+              point.time <= right.time
+            );
+          });
+          const verticalSegment = sorted.slice(0, -1).find((left, index) => {
+            const right = sorted[index + 1];
+            return (
+              Math.abs(left.time - right.time) < 0.001 &&
+              point.value >= Math.min(left.value, right.value) &&
+              point.value <= Math.max(left.value, right.value)
+            );
+          });
+          const segment = horizontalSegment ?? verticalSegment;
+          if (!segment) return;
+          const index = sorted.indexOf(segment);
+          const orientation = horizontalSegment ? "horizontal" : "vertical";
+          if (orientation === "vertical" && index === 0) return;
+          event.preventDefault();
+          event.stopPropagation();
+          segmentDrag.current = {
+            orientation,
+            leftIndex: data.points.indexOf(segment),
+            rightIndex: data.points.indexOf(sorted[index + 1]),
+            startX: event.clientX,
+            startY: event.clientY,
+            startTime: segment.time,
+            startValue: segment.value,
+          };
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          const drag = segmentDrag.current;
+          if (!drag || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+          if (drag.orientation === "vertical") {
+            const nextTime = Math.min(
+              duration,
+              Math.max(
+                0,
+                snap(
+                  drag.startTime + (event.clientX - drag.startX) / zoom,
+                  grid,
+                ),
+              ),
+            );
+            onChange({
+              ...data,
+              points: data.points.map((item, index) =>
+                  index === drag.leftIndex || index === drag.rightIndex
+                    ? { ...item, time: nextTime }
+                    : item,
+                ),
+            });
+            return;
+          }
+          const nextValue = Math.min(
+            1,
+            Math.max(0, drag.startValue - (event.clientY - drag.startY) / 150),
+          );
+          onChange({
+            ...data,
+            points: data.points.map((item, index) =>
+              index === drag.leftIndex || index === drag.rightIndex
+                ? { ...item, value: nextValue }
+                : item,
+            ),
+          });
+        }}
+        onPointerUp={(event) => {
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }
+          segmentDrag.current = null;
+        }}
+        onPointerCancel={() => {
+          segmentDrag.current = null;
+        }}
+      />
+      {sorted.map((point, index) => <circle className="waypoint" key={index} cx={Math.max(7, point.time * zoom)} cy={(1 - point.value) * 150} r="6"
+        onPointerDown={(event) => {
+          event.stopPropagation();
+          const pointerPoint = toPoint(event.clientX, event.clientY);
+          waypointDrag.current = {
+            point,
+            timeOffset: (pointerPoint?.time ?? point.time) - point.time,
+          };
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
         onPointerMove={(event) => {
           if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
           const next = toPoint(event.clientX, event.clientY);
           if (!next) return;
           if (activeSplineEffect && !isWithinActiveSpline(point.time)) return;
-          const adjusted = activeSplineEffect ? { ...next, time: clampToActiveSpline(next.time) } : next;
+          const neighborValues = [sorted[index - 1], sorted[index + 1]]
+            .filter((neighbor): neighbor is Point => Boolean(neighbor))
+            .map((neighbor) => neighbor.value);
+          const snappedValue =
+            (event.ctrlKey || event.metaKey) && neighborValues.length
+              ? neighborValues.reduce((closest, value) =>
+                  Math.abs(value - next.value) < Math.abs(closest - next.value)
+                    ? value
+                    : closest,
+                )
+              : next.value;
+          const draggedTime = Math.max(
+            0,
+            Math.min(
+              duration,
+              next.time - (waypointDrag.current?.timeOffset ?? 0),
+            ),
+          );
+          const adjusted =
+            index === 0
+              ? { ...next, time: point.time, value: snappedValue }
+              : activeSplineEffect
+                ? {
+                    ...next,
+                    time: clampToActiveSpline(draggedTime),
+                    value: snappedValue,
+                  }
+                : { ...next, time: draggedTime, value: snappedValue };
           onChange({ ...data, points: data.points.map((item) => item === point ? adjusted : item).sort((a, b) => a.time - b.time) });
+        }}
+        onPointerUp={(event) => {
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }
+          waypointDrag.current = null;
+        }}
+        onPointerCancel={() => {
+          waypointDrag.current = null;
         }} />)}
     </svg>
   </div>;
@@ -3376,8 +3622,10 @@ function ColorLane({ fixtureId, clips, transitions, zoom, grid, duration, width,
         style={{
           left: transition.start * zoom,
           width: Math.max(24, transition.duration * zoom),
+          "--transition-from": transition.fromColor,
+          "--transition-to": transition.toColor,
           background: `linear-gradient(90deg, ${transition.fromColor}, ${transition.toColor})`,
-        }}
+        } as CSSProperties}
         title={`${transition.duration.toFixed(1)} second color transition`}
         onContextMenu={(event) => {
           event.preventDefault();
