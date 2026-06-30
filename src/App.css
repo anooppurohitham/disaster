@@ -346,6 +346,143 @@ select {
   letter-spacing: -.03em;
 }
 
+.appRecentGrid {
+  display: grid;
+  max-width: 1180px;
+  margin: 0 auto 24px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.appRecentPanel {
+  min-width: 0;
+  padding: 20px;
+  background: linear-gradient(180deg, #171c24, #11151c);
+  border: 1px solid #2a323d;
+  border-radius: 18px;
+  box-shadow: 0 18px 42px rgb(0 0 0 / 16%);
+}
+
+.appRecentHeader {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.appRecentHeader small {
+  color: #7f8a98;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .12em;
+}
+
+.appRecentHeader h2 {
+  margin: 5px 0 0;
+  font-size: 18px;
+}
+
+.appRecentHeader > button {
+  padding: 8px 11px;
+  color: #dcecff;
+  background: #19345a;
+  border: 1px solid #3e6da8;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.appRecentHeader > button:hover {
+  color: white;
+  background: #214573;
+  border-color: #5787c2;
+}
+
+.appRecentList {
+  display: grid;
+  gap: 8px;
+}
+
+.appRecentItem {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  padding: 10px;
+  color: #e7edf4;
+  text-align: left;
+  background: rgb(9 12 17 / 58%);
+  border: 1px solid #252e39;
+  border-radius: 11px;
+}
+
+.appRecentItem:hover {
+  background: #19212b;
+  border-color: #3f5f83;
+}
+
+.appRecentFileType {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  color: #9bc5ff;
+  background: #172c48;
+  border: 1px solid #315b8e;
+  border-radius: 9px;
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: .08em;
+}
+
+.appRecentFileType.audio {
+  color: #c8f59a;
+  background: #20331b;
+  border-color: #466d35;
+}
+
+.appRecentItem > span:nth-child(2) {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.appRecentItem strong,
+.appRecentItem small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.appRecentItem strong {
+  font-size: 12px;
+}
+
+.appRecentItem small {
+  color: #7f8b99;
+  font-size: 9px;
+}
+
+.appRecentItem i {
+  color: #7fa9dc;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.appRecentEmpty {
+  margin: 0;
+  padding: 18px 12px;
+  color: #788493;
+  text-align: center;
+  background: rgb(9 12 17 / 35%);
+  border: 1px dashed #2b3541;
+  border-radius: 11px;
+  font-size: 11px;
+}
+
 .appInfoGrid {
   display: grid;
   gap: 20px;
@@ -403,11 +540,15 @@ select {
 
 .appInfoStatusBadge {
   display: inline-flex;
+  align-self: start;
+  justify-self: start;
+  align-items: center;
   width: fit-content;
   padding: 7px 12px;
-  border-radius: 999px;
+  border-radius: 8px;
   font-size: 12px;
   font-weight: 800;
+  line-height: 1;
   letter-spacing: .04em;
   text-transform: uppercase;
   border: 1px solid transparent;
@@ -479,6 +620,7 @@ select {
 }
 
 @media (max-width: 1080px) {
+  .appRecentGrid,
   .appInfoGrid {
     grid-template-columns: 1fr;
   }
@@ -544,6 +686,118 @@ input[type="range"] {
   gap: 6px;
   font-weight: 600;
   user-select: none;
+}
+
+.artNetUniverseControl {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #aeb8c5;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.artNetUniverseControl input {
+  width: 76px;
+  padding: 8px;
+}
+
+.artNetEnableToggle {
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  color: #a8b2bf;
+  background: #151a21;
+  border: 1px solid #313a46;
+  border-radius: 9px;
+}
+
+.artNetEnableToggle.enabled {
+  color: #d9ebff;
+  background: #172a40;
+  border-color: #4577b2;
+}
+
+.artNetEnableToggle input {
+  accent-color: #4d91eb;
+}
+
+.artNetEnableToggle > span {
+  display: grid;
+  gap: 1px;
+}
+
+.artNetEnableToggle strong {
+  font-size: 11px;
+}
+
+.artNetEnableToggle small {
+  color: #7f8c9b;
+  font-size: 8px;
+}
+
+.dmxOutputChecklist {
+  display: grid;
+  min-width: min(100%, 360px);
+  max-height: 210px;
+  gap: 6px;
+  padding: 7px;
+  overflow-y: auto;
+  background: #0f1319;
+  border: 1px solid #303946;
+  border-radius: 10px;
+}
+
+.dmxOutputChecklist > label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 8px 9px;
+  color: #dce3eb;
+  background: #181e27;
+  border: 1px solid #293340;
+  border-radius: 8px;
+}
+
+.dmxOutputChecklist > label:has(input:checked) {
+  background: #182b42;
+  border-color: #477bb9;
+}
+
+.dmxOutputChecklist > label > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.dmxOutputChecklist strong,
+.dmxOutputChecklist small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dmxOutputChecklist strong {
+  font-size: 11px;
+}
+
+.dmxOutputChecklist small {
+  color: #7f8c9b;
+  font-size: 9px;
+}
+
+.dmxOutputChecklist input {
+  accent-color: #4d91eb;
+}
+
+.dmxOutputEmpty {
+  padding: 12px;
+  color: #7d8896;
+  text-align: center;
+  font-size: 11px;
 }
 
 select {
@@ -1602,7 +1856,10 @@ select {
   background: #101319;
   border-right: 1px solid #303640;
   box-shadow: 5px 0 16px rgb(0 0 0 / 18%);
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-color: #303946 #101319;
+  scrollbar-width: thin;
 }
 
 .libraryTitle {
@@ -1661,10 +1918,119 @@ select {
   border-radius: 50%;
 }
 
+.cueAssistant {
+  display: grid;
+  flex: 0 0 auto;
+  min-height: 0;
+  margin-top: auto;
+  padding-top: 9px;
+  gap: 7px;
+  border-top: 1px solid #29303a;
+}
+
+.cueAssistantHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 3px;
+  color: #9ba8b8;
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: .12em;
+}
+
+.cueAssistantHeader small {
+  padding: 2px 5px;
+  color: #91bfff;
+  background: rgb(49 133 255 / 12%);
+  border: 1px solid rgb(49 133 255 / 30%);
+  border-radius: 5px;
+  font-size: 8px;
+  letter-spacing: .08em;
+}
+
+.cueAssistantMessages {
+  display: grid;
+  align-content: end;
+  min-height: 44px;
+  max-height: 76px;
+  gap: 5px;
+  overflow-y: auto;
+  scrollbar-color: #3d4755 #101319;
+  scrollbar-width: thin;
+}
+
+.cueAssistantMessages p {
+  margin: 0;
+  padding: 6px 7px;
+  color: #aeb7c4;
+  background: #171c23;
+  border: 1px solid #252d38;
+  border-radius: 7px;
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.cueAssistantMessages .user {
+  margin-left: 12px;
+  color: #dcecff;
+  background: #17283e;
+  border-color: #294b74;
+}
+
+.cueAssistantMessages .success {
+  color: #b8eec3;
+  border-color: #275a36;
+}
+
+.cueAssistantMessages .error {
+  color: #ffd0a1;
+  border-color: #704522;
+}
+
+.cueAssistant textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 54px;
+  resize: none;
+  padding: 7px 8px;
+  color: #e8edf4;
+  background: #0b0e13;
+  border: 1px solid #303844;
+  border-radius: 8px;
+  outline: none;
+  font: 10px/1.35 Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+.cueAssistant textarea:focus {
+  border-color: #477fca;
+  box-shadow: 0 0 0 2px rgb(49 133 255 / 12%);
+}
+
+.cueAssistantSend {
+  padding: 7px 9px;
+  color: #edf5ff;
+  background: linear-gradient(180deg, #326dbd, #25538f);
+  border: 1px solid #4b83cc;
+  border-radius: 7px;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.cueAssistantSend:hover:not(:disabled) {
+  background: linear-gradient(180deg, #3c7bcf, #2c609f);
+}
+
+.cueAssistantSend:disabled {
+  opacity: .4;
+}
+
 .fixtureScroller {
   display: flex;
+  flex: 1 1 100px;
   flex-direction: column;
-  max-height: 370px;
+  min-height: 60px;
+  max-height: 240px;
   margin-top: 2px;
   padding-right: 4px;
   overflow-y: auto;
@@ -1763,9 +2129,10 @@ select {
 
 .effectScroller {
   display: grid;
-  flex: 0 0 auto;
+  flex: 0 1 110px;
   gap: 8px;
-  max-height: 180px;
+  min-height: 50px;
+  max-height: 110px;
   margin-top: 8px;
   padding-right: 4px;
   overflow: auto;
@@ -2300,6 +2667,99 @@ select {
     0 0 0 1px rgb(255 255 255 / 18%);
 }
 
+.colorTransitionBlock {
+  position: absolute;
+  z-index: 5;
+  top: 5px;
+  bottom: 5px;
+  display: grid;
+  min-width: 24px;
+  align-content: center;
+  justify-items: center;
+  gap: 1px;
+  padding: 0 5px;
+  overflow: hidden;
+  color: white;
+  border: 1px solid rgb(255 255 255 / 72%);
+  border-radius: 5px;
+  box-shadow:
+    inset 0 0 0 1px rgb(0 0 0 / 20%),
+    0 0 12px rgb(106 165 255 / 22%);
+  text-shadow: 0 1px 2px #000;
+}
+
+.colorTransitionBlock:hover {
+  z-index: 9;
+  border-color: white;
+}
+
+.colorTransitionBlock strong {
+  overflow: hidden;
+  max-width: 100%;
+  font-size: 7px;
+  letter-spacing: .08em;
+  text-overflow: ellipsis;
+}
+
+.colorTransitionBlock span {
+  font-size: 8px;
+}
+
+.colorTransitionBoundary {
+  position: absolute;
+  z-index: 10;
+  top: 0;
+  bottom: 0;
+  width: 18px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  transform: translateX(-50%);
+}
+
+.colorTransitionBoundary::after {
+  content: "";
+  position: absolute;
+  top: 5px;
+  bottom: 5px;
+  left: 8px;
+  width: 2px;
+  background: rgb(255 255 255 / 0%);
+  transition: background .12s ease;
+}
+
+.colorTransitionBoundary:hover::after {
+  background: rgb(255 255 255 / 85%);
+}
+
+.colorTransitionBoundary span {
+  position: absolute;
+  bottom: calc(100% + 5px);
+  left: 50%;
+  width: max-content;
+  padding: 6px 8px;
+  color: #eaf3ff;
+  background: #17263a;
+  border: 1px solid #4c7dbb;
+  border-radius: 7px;
+  box-shadow: 0 8px 20px rgb(0 0 0 / 38%);
+  font-size: 9px;
+  font-weight: 800;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(3px);
+  transition:
+    opacity .12s ease,
+    transform .12s ease;
+}
+
+.colorTransitionBoundary:hover span,
+.colorTransitionBoundary:focus-visible span {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
 .timelineV2 .colorLane .laneBeatLines {
   z-index: 0;
 }
@@ -2589,6 +3049,9 @@ select {
 
 .universeHoverCard {
   display: grid;
+  min-width: 280px;
+  min-height: 42px;
+  box-sizing: border-box;
   gap: 2px;
   padding: 8px 10px;
   color: #dfe5ec;
@@ -2596,6 +3059,14 @@ select {
   border: 1px solid #313944;
   border-radius: 8px;
   box-shadow: 0 8px 18px rgb(0 0 0 / 22%);
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.universeHoverCard.isVisible {
+  opacity: 1;
+  visibility: visible;
 }
 
 .universeHoverCard strong {
@@ -2632,9 +3103,12 @@ select {
 }
 
 .universeGrid button {
+  display: grid;
   min-width: 20px;
-  height: 23px;
+  height: 32px;
   padding: 0;
+  place-content: center;
+  gap: 1px;
   color: #68717d;
   background: #242931;
   border: 1px solid #303741;
@@ -2642,10 +3116,31 @@ select {
   font-size: 7px;
 }
 
+.universeGrid .channelValue {
+  color: #dce5ef;
+  font-size: 8px;
+  line-height: 1;
+}
+
+.universeGrid .channelAddress {
+  color: #697483;
+  font-size: 6px;
+  line-height: 1;
+}
+
 .universeGrid .occupiedChannel {
   color: white;
   background: color-mix(in srgb, var(--fixture-color) 65%, #15181d);
   border-color: var(--fixture-color);
+}
+
+.universeGrid .occupiedChannel .channelValue {
+  color: white;
+  text-shadow: 0 1px 2px rgb(0 0 0 / 65%);
+}
+
+.universeGrid .occupiedChannel .channelAddress {
+  color: rgb(255 255 255 / 72%);
 }
 
 .universeGrid .activeChannel {
@@ -3370,12 +3865,29 @@ select {
 }
 
 .timelineContextMenu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: 8px 10px;
   color: inherit;
   text-align: left;
   background: transparent;
   border: 0;
   border-radius: 5px;
+}
+
+.timelineContextMenu button small {
+  color: #6f7987;
+  font-size: 9px;
+}
+
+.timelineContextMenu hr,
+.clipContextMenu hr {
+  width: 100%;
+  height: 1px;
+  margin: 4px 0;
+  background: #303741;
+  border: 0;
 }
 
 .timelineContextMenu button:hover:not(:disabled) {
@@ -3402,13 +3914,54 @@ select {
   box-shadow: 0 12px 30px rgb(0 0 0 / 45%);
 }
 
+.clipContextMenu button:disabled {
+  color: #59616c;
+}
+
+.colorTransitionDialog {
+  width: min(420px, calc(100vw - 40px));
+}
+
+.colorTransitionDialog > label {
+  display: grid;
+  gap: 8px;
+  color: #cdd6e1;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.transitionDurationInput {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.transitionDurationInput input {
+  min-width: 0;
+  padding: 9px 10px;
+  color: #edf3fa;
+  background: #11161d;
+  border: 1px solid #384454;
+  border-radius: 8px;
+}
+
+.transitionDurationInput span {
+  color: #8793a2;
+  font-size: 11px;
+}
+
 .clipContextMenu button {
   padding: 8px 10px;
-  color: #ff8b86;
+  color: #dce3eb;
   text-align: left;
   background: transparent;
   border: 0;
   border-radius: 5px;
+}
+
+.clipContextMenu button:last-child {
+  color: #ff8b86;
 }
 
 .clipContextMenu button:hover {

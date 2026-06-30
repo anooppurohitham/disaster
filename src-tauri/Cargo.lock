@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "dmx-timeline"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "serde",
  "serde_json",

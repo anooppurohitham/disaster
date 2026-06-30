@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Updater signing keys
+disaster-updater.key
+disaster-updater.key.pub

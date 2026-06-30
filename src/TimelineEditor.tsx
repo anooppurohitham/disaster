@@ -3,6 +3,16 @@ import { getFixtureMode, type PatchedFixture } from "./App";
 
 type Point = { time: number; value: number };
 type ColorClip = { id: string; start: number; duration: number; color: string };
+type ColorTransition = {
+  id: string;
+  start: number;
+  duration: number;
+  fromColor: string;
+  toColor: string;
+  leftClipId?: string;
+  rightClipId?: string;
+  boundary?: number;
+};
 type StrobeClip = { id: string; start: number; duration: number; rate: number };
 type PulseEffect = {
   id: string;
@@ -40,6 +50,7 @@ type IntensityEffect = PulseEffect | SlopeEffect | SplineEffect | RandomEffect;
 export type TrackData = {
   points: Point[];
   colors: ColorClip[];
+  colorTransitions: ColorTransition[];
   strobes: StrobeClip[];
   effects: IntensityEffect[];
   curve: "straight" | "smooth";
@@ -68,8 +79,63 @@ type StageTab = {
   name: string;
 };
 
+type StagePlacement = {
+  fixtureId: string;
+  x: number;
+  y: number;
+};
+
+type CueAssistantMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  tone?: "success" | "error";
+};
+
+type ParsedCueCommand = {
+  fixtureIds: string[];
+  targetLabel: string;
+  start: number;
+  end: number;
+  intensity: number | null;
+  color: string | null;
+  strobe: number | null;
+  clearStrobe: boolean;
+  intensityEffect: "pulse" | "fade" | "rise" | null;
+  pulseActiveLength: number;
+  pulseSpacingLength: number;
+  transitionFromColor: string | null;
+  transitionToColor: string | null;
+};
+
+type TimelineHistorySnapshot = {
+  tracks: Record<string, TrackData>;
+  duration: number;
+  fixtureGroups: FixtureGroup[];
+};
+
 const LABEL_WIDTH = 240;
 const COLORS = ["#3185ff", "#e246b6", "#ffb52e", "#55d982", "#f2f4f8", "#ef5350"];
+const CUE_COLORS: Array<[string, string]> = [
+  ["warm white", "#ffd8a8"],
+  ["cool white", "#dff3ff"],
+  ["deep blue", "#174cff"],
+  ["light blue", "#67c8ff"],
+  ["hot pink", "#ff3ca6"],
+  ["magenta", "#ff00d4"],
+  ["purple", "#8a42ff"],
+  ["violet", "#7145ff"],
+  ["orange", "#ff7a1a"],
+  ["yellow", "#ffd52a"],
+  ["green", "#27dc68"],
+  ["cyan", "#20e0e0"],
+  ["blue", "#287cff"],
+  ["pink", "#ff62b7"],
+  ["red", "#ff3434"],
+  ["white", "#ffffff"],
+  ["amber", "#ffb52e"],
+  ["lime", "#a8ff38"],
+];
 const uid = () => crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 const snap = (time: number, grid: number) => Math.max(0, Math.round(time / grid) * grid);
 const DEFAULT_TRACK_POINTS: Point[] = [{ time: 0, value: 0.25 }, { time: 8, value: 0.25 }];
@@ -88,8 +154,15 @@ type EffectEditorState =
   | { mode: "edit"; fixtureId: string; effectId: string; type: EffectType; values: EffectEditorValues };
 type ItemContextMenuState =
   | { kind: "color"; x: number; y: number; fixtureId: string; clipId: string }
+  | { kind: "colorTransition"; x: number; y: number; fixtureId: string; transitionId: string }
   | { kind: "strobe"; x: number; y: number; fixtureId: string; clipId: string }
   | { kind: "effect"; x: number; y: number; fixtureId: string; effectId: string };
+type ColorTransitionEditorState = {
+  fixtureId: string;
+  leftClipId: string;
+  rightClipId: string;
+  duration: number;
+};
 const rippleColors = (clips: ColorClip[], duration: number) => {
   let previousEnd = 0;
   return clips.map((clip) => {
@@ -105,6 +178,236 @@ const rippleColors = (clips: ColorClip[], duration: number) => {
 };
 const clock = (time: number) =>
   `${Math.floor(time / 60)}:${String(Math.floor(time % 60)).padStart(2, "0")}.${Math.floor((time % 1) * 10)}`;
+
+export function interpolateHexColor(fromColor: string, toColor: string, progress: number) {
+  const from = fromColor.replace("#", "");
+  const to = toColor.replace("#", "");
+  if (!/^[0-9a-f]{6}$/i.test(from) || !/^[0-9a-f]{6}$/i.test(to)) {
+    return progress < 0.5 ? fromColor : toColor;
+  }
+  const amount = Math.min(1, Math.max(0, progress));
+  const channels = [0, 2, 4].map((offset) => {
+    const start = Number.parseInt(from.slice(offset, offset + 2), 16);
+    const end = Number.parseInt(to.slice(offset, offset + 2), 16);
+    return Math.round(start + (end - start) * amount).toString(16).padStart(2, "0");
+  });
+  return `#${channels.join("")}`;
+}
+
+function parseCueTime(value: string) {
+  const normalized = value.trim().toLowerCase();
+  const clockMatch = normalized.match(/^(\d+):(\d+(?:\.\d+)?)$/);
+  if (clockMatch) {
+    return Number(clockMatch[1]) * 60 + Number(clockMatch[2]);
+  }
+  const numeric = Number.parseFloat(normalized);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function parseCueCommand(
+  input: string,
+  fixtures: PatchedFixture[],
+  placements: StagePlacement[],
+  selectedFixtureIds: string[],
+  playhead: number,
+): ParsedCueCommand {
+  const normalized = input.trim().toLowerCase();
+  if (!normalized) throw new Error("Type a lighting instruction first.");
+
+  const explicitlyNamed = fixtures.filter((fixture) =>
+    normalized.includes(fixture.name.toLowerCase()),
+  );
+  const spatialWords = {
+    left: /\bleft\b/.test(normalized),
+    right: /\bright\b/.test(normalized),
+    front: /\bfront\b/.test(normalized),
+    back: /\b(back|rear)\b/.test(normalized),
+  };
+  const hasSpatialTarget = Object.values(spatialWords).some(Boolean);
+  const placementByFixtureId = new Map(
+    placements.map((placement) => [placement.fixtureId, placement]),
+  );
+
+  let targets: PatchedFixture[];
+  let targetLabel: string;
+  if (explicitlyNamed.length) {
+    targets = explicitlyNamed;
+    targetLabel = explicitlyNamed.map((fixture) => fixture.name).join(", ");
+  } else if (hasSpatialTarget) {
+    targets = fixtures.filter((fixture) => {
+      const placement = placementByFixtureId.get(fixture.id);
+      if (!placement) return false;
+      if (spatialWords.left && !spatialWords.right && placement.x >= 0.5) return false;
+      if (spatialWords.right && !spatialWords.left && placement.x < 0.5) return false;
+      // The bottom of the 2D plot is the front/audience edge of the stage.
+      if (spatialWords.front && !spatialWords.back && placement.y < 0.5) return false;
+      if (spatialWords.back && !spatialWords.front && placement.y >= 0.5) return false;
+      return true;
+    });
+    targetLabel = [
+      spatialWords.front ? "front" : "",
+      spatialWords.back ? "back" : "",
+      spatialWords.left ? "left" : "",
+      spatialWords.right ? "right" : "",
+      "fixtures",
+    ].filter(Boolean).join(" ");
+    if (!targets.length) {
+      throw new Error(`No placed fixtures match “${targetLabel}”. Arrange them in Stage View first.`);
+    }
+  } else if (/\b(selected|these)\b/.test(normalized) && selectedFixtureIds.length) {
+    targets = fixtures.filter((fixture) => selectedFixtureIds.includes(fixture.id));
+    targetLabel = "selected fixtures";
+  } else {
+    targets = fixtures;
+    targetLabel = "all fixtures";
+  }
+
+  if (!targets.length) throw new Error("There are no fixtures to program.");
+
+  const startMatch = normalized.match(
+    /(?:\bat\b|\bfrom\b|\bstarting(?:\s+at)?\b)\s*(\d+:\d+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(minutes?|mins?|m\b|seconds?|secs?|s\b)?/,
+  );
+  const untilMatch = normalized.match(
+    /\b(?:until|to)\s*(\d+:\d+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(minutes?|mins?|m\b|seconds?|secs?|s\b)?/,
+  );
+  const lengthMatch = normalized.match(
+    /\bfor\s*(\d+(?:\.\d+)?)\s*(seconds?|secs?|s\b|minutes?|mins?|m\b)/,
+  );
+  const startUnitMultiplier =
+    startMatch?.[2] && /^(m|mins?|minutes?)/.test(startMatch[2]) ? 60 : 1;
+  const parsedStart = startMatch
+    ? (parseCueTime(startMatch[1]) ?? playhead) * (
+        startMatch[1].includes(":") ? 1 : startUnitMultiplier
+      )
+    : playhead;
+  const start = Math.max(0, parsedStart ?? playhead);
+  const requestedLength = lengthMatch
+    ? Number(lengthMatch[1]) * (/^(m|mins?|minutes?)/.test(lengthMatch[2]) ? 60 : 1)
+    : null;
+  const untilUnitMultiplier =
+    untilMatch?.[2] && /^(m|mins?|minutes?)/.test(untilMatch[2]) ? 60 : 1;
+  const parsedUntil = untilMatch
+    ? (parseCueTime(untilMatch[1]) ?? start) * (
+        untilMatch[1].includes(":") ? 1 : untilUnitMultiplier
+      )
+    : null;
+  const end = Math.max(
+    start + 0.05,
+    parsedUntil ?? (requestedLength !== null ? start + requestedLength : start + 4),
+  );
+
+  const clearStrobe = /\b(steady|strobe off|stop strobing|no strobe)\b/.test(normalized);
+  const wantsPulse = /\b(pulse|pulsing|pulsate|pulsating|flash|flashing|blink|blinking)\b/.test(normalized);
+  const wantsRise =
+    /\b(fade in|fade up|rise|rising|gradually (?:turn|come) on|gradually brighten|slowly brighten)\b/.test(normalized);
+  const wantsFade =
+    !wantsRise &&
+    /\b(fade|fading|fade out|fade down|gradually (?:turn|go) off|gradually dim|slowly dim)\b/.test(normalized);
+  let intensityEffect: ParsedCueCommand["intensityEffect"] = wantsPulse
+    ? "pulse"
+    : wantsRise
+      ? "rise"
+      : wantsFade
+        ? "fade"
+        : null;
+  const percentMatch = normalized.match(/(\d+(?:\.\d+)?)\s*%/);
+  let intensity: number | null = percentMatch
+    ? clamp01(Number(percentMatch[1]) / 100)
+    : null;
+  if (!clearStrobe && /\b(off|blackout|dark)\b/.test(normalized)) intensity = 0;
+  else if (/\b(full|maximum|max)\b/.test(normalized)) intensity = 1;
+  else if (/\b(dim|low)\b/.test(normalized)) intensity = 0.35;
+  else if (/\b(bright)\b/.test(normalized)) intensity = 0.8;
+  else if (/\b(on|turn on|light up)\b/.test(normalized)) intensity = 1;
+
+  const rawColorMentions = [
+    ...CUE_COLORS.flatMap(([name, value]) => {
+      const match = new RegExp(`\\b${name.replace(" ", "\\s+")}\\b`).exec(normalized);
+      return match ? [{ index: match.index, length: match[0].length, value }] : [];
+    }),
+    ...Array.from(normalized.matchAll(/#[0-9a-f]{6}\b/g), (match) => ({
+      index: match.index ?? 0,
+      length: match[0].length,
+      value: match[0],
+    })),
+  ].sort((a, b) => a.index - b.index || b.length - a.length);
+  const colorMentions = rawColorMentions.filter(
+    (mention, index, mentions) =>
+      !mentions.some(
+        (other, otherIndex) =>
+          otherIndex < index &&
+          mention.index < other.index + other.length &&
+          mention.index + mention.length > other.index,
+      ),
+  );
+  const wantsColorTransition =
+    colorMentions.length >= 2 &&
+    (
+      /\b(color transition|transition|blend|crossfade|cross fade)\b/.test(normalized) ||
+      /\bfade\s+from\b/.test(normalized) ||
+      /\bfrom\s+\S+\s+to\s+\S+/.test(normalized)
+    );
+  const transitionFromColor = wantsColorTransition ? colorMentions[0].value : null;
+  const transitionToColor = wantsColorTransition ? colorMentions[1].value : null;
+  const color = wantsColorTransition ? null : colorMentions[0]?.value ?? null;
+  if (wantsColorTransition && intensityEffect === "fade") {
+    intensityEffect = null;
+  }
+
+  // Only explicit strobe language is allowed to manipulate a fixture's strobe channel.
+  const wantsStrobe = /\b(strobe|strobing)\b/.test(normalized);
+  const rateMatch = normalized.match(/(\d+(?:\.\d+)?)\s*hz\b/);
+  let strobe: number | null = null;
+  if (wantsStrobe && !clearStrobe) {
+    strobe = rateMatch
+      ? Math.min(30, Math.max(0.5, Number(rateMatch[1])))
+      : /\bfast\b/.test(normalized)
+        ? 16
+        : /\bslow\b/.test(normalized)
+          ? 4
+          : 8;
+  }
+
+  if ((color || strobe !== null) && intensity === null) intensity = 1;
+  if (wantsColorTransition && intensity === null) intensity = 1;
+  if (intensityEffect && intensity === null) intensity = 1;
+  if (
+    intensity === null &&
+    !color &&
+    strobe === null &&
+    !clearStrobe &&
+    !intensityEffect &&
+    !wantsColorTransition
+  ) {
+    throw new Error(
+      "I could not find an intensity, color, or strobe instruction. Try “front lights blue at 10 seconds for 4 seconds”.",
+    );
+  }
+
+  return {
+    fixtureIds: targets.map((fixture) => fixture.id),
+    targetLabel,
+    start,
+    end,
+    intensity,
+    color,
+    strobe,
+    clearStrobe,
+    intensityEffect,
+    pulseActiveLength: /\bfast\b/.test(normalized)
+      ? 0.15
+      : /\bslow\b/.test(normalized)
+        ? 0.75
+        : 0.35,
+    pulseSpacingLength: /\bfast\b/.test(normalized)
+      ? 0.15
+      : /\bslow\b/.test(normalized)
+        ? 0.75
+        : 0.35,
+    transitionFromColor,
+    transitionToColor,
+  };
+}
 const documentSignature = (document: TimelineDocumentData | null) => JSON.stringify(document ?? null);
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
 const seededRandom = (seed: number) => {
@@ -303,6 +606,7 @@ function normalizeTrackData(track?: Partial<TrackData> | null): TrackData {
   return {
     points: normalizePoints(track?.points?.map((point) => ({ ...point })) ?? DEFAULT_TRACK_POINTS.map((point) => ({ ...point }))),
     colors: track?.colors?.map((clip) => ({ ...clip })) ?? [],
+    colorTransitions: track?.colorTransitions?.map((transition) => ({ ...transition })) ?? [],
     strobes: track?.strobes?.map((clip) => ({ ...clip })) ?? [],
     effects: track?.effects?.map((effect) => ({ ...effect })) ?? [],
     curve: track?.curve ?? "straight",
@@ -366,7 +670,10 @@ export default function TimelineEditor({
   onDocumentStateChange,
   onAudioSourceChange,
   initialAudioSourceUrl,
+  requestedAudioFile,
+  onRequestedAudioHandled,
   initialDocumentState,
+  stagePlacements,
   stages,
   activeStageId,
   onSelectStage,
@@ -385,9 +692,12 @@ export default function TimelineEditor({
   ) => void;
   onColorPreviewChange: (color: string | null) => void;
   onDocumentStateChange: (document: TimelineDocumentData) => void;
-  onAudioSourceChange: (audio: { name: string; url: string } | null) => void;
+  onAudioSourceChange: (audio: { name: string; url: string; file?: File } | null) => void;
   initialAudioSourceUrl: string | null;
+  requestedAudioFile: { id: string; file: File } | null;
+  onRequestedAudioHandled: () => void;
   initialDocumentState: TimelineDocumentData | null;
+  stagePlacements: StagePlacement[];
   stages: StageTab[];
   activeStageId: string;
   onSelectStage: (stageId: string) => void;
@@ -424,8 +734,11 @@ export default function TimelineEditor({
   const [selectionMode, setSelectionMode] = useState(false);
   const [selections, setSelections] = useState<Selection[]>([]);
   const [clipboard, setClipboard] = useState<TrackData | null>(null);
+  const [transitionClipboard, setTransitionClipboard] = useState<ColorTransition | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [itemContextMenu, setItemContextMenu] = useState<ItemContextMenuState | null>(null);
+  const [colorTransitionEditor, setColorTransitionEditor] =
+    useState<ColorTransitionEditorState | null>(null);
   const [tracks, setTracks] = useState<Record<string, TrackData>>(
     Object.fromEntries(
       Object.entries(initialDocumentState?.tracks ?? {}).map(([key, value]) => [key, normalizeTrackData(value)]),
@@ -437,6 +750,14 @@ export default function TimelineEditor({
   const [fixtureGroups, setFixtureGroups] = useState<FixtureGroup[]>(
     initialDocumentState?.fixtureGroups ?? [],
   );
+  const [cueAssistantInput, setCueAssistantInput] = useState("");
+  const [cueAssistantMessages, setCueAssistantMessages] = useState<CueAssistantMessage[]>([
+    {
+      id: "cue-assistant-welcome",
+      role: "assistant",
+      text: "Try “transition all lights from blue to red from 0 to 10s” or “left lights pulse blue for 8s”.",
+    },
+  ]);
   const [expandedGroupIds, setExpandedGroupIds] = useState<string[]>([]);
   const [scrollPosition, setScrollPosition] = useState(0);
   const [viewportWidth, setViewportWidth] = useState(1080);
@@ -448,7 +769,9 @@ export default function TimelineEditor({
   const audioRef = useRef<HTMLAudioElement>(null);
   const audioUrlRef = useRef("");
   const loadedAudioSourceRef = useRef<string | null>(null);
-  const undoStackRef = useRef<Record<string, TrackData>[]>([]);
+  const requestedAudioIdRef = useRef<string | null>(null);
+  const undoStackRef = useRef<TimelineHistorySnapshot[]>([]);
+  const redoStackRef = useRef<TimelineHistorySnapshot[]>([]);
   const hydratingDocumentRef = useRef(false);
   const hydrationFrameRef = useRef<number | null>(null);
   const lastEmittedDocumentSignatureRef = useRef<string | null>(null);
@@ -476,7 +799,13 @@ export default function TimelineEditor({
 
   function isNeutralTrackData(track?: TrackData) {
     if (!track) return true;
-    if (track.colors.length || track.strobes.length || track.effects.length || track.curve !== "straight") return false;
+    if (
+      track.colors.length ||
+      track.colorTransitions.length ||
+      track.strobes.length ||
+      track.effects.length ||
+      track.curve !== "straight"
+    ) return false;
     if (track.points.length !== DEFAULT_TRACK_POINTS.length) return false;
     return track.points.every(
       (point, index) =>
@@ -499,9 +828,21 @@ export default function TimelineEditor({
     const intensity = before && after
       ? before.value + (after.value - before.value) * Math.min(1, Math.max(0, progress))
       : 0;
-    const color = [...data.colors].reverse().find(
+    const activeTransition = [...data.colorTransitions].reverse().find(
+      (transition) =>
+        currentPlayhead >= transition.start &&
+        currentPlayhead < transition.start + transition.duration,
+    );
+    const solidColor = [...data.colors].reverse().find(
       (clip) => currentPlayhead >= clip.start && currentPlayhead < clip.start + clip.duration,
     )?.color ?? null;
+    const color = activeTransition
+      ? interpolateHexColor(
+          activeTransition.fromColor,
+          activeTransition.toColor,
+          (currentPlayhead - activeTransition.start) / Math.max(0.001, activeTransition.duration),
+        )
+      : solidColor;
     const strobe = [...data.strobes].reverse().find(
       (clip) => currentPlayhead >= clip.start && currentPlayhead < clip.start + clip.duration,
     )?.rate ?? null;
@@ -584,8 +925,10 @@ export default function TimelineEditor({
     setSelectionMode(false);
     setSelections([]);
     setClipboard(null);
+    setTransitionClipboard(null);
     setContextMenu(null);
     setItemContextMenu(null);
+    setColorTransitionEditor(null);
     setTracks(
       Object.fromEntries(
         Object.entries(initialDocumentState?.tracks ?? {}).map(([key, value]) => [key, normalizeTrackData(value)]),
@@ -605,6 +948,7 @@ export default function TimelineEditor({
           ),
     );
     undoStackRef.current = [];
+    redoStackRef.current = [];
     if (viewportRef.current) {
       viewportRef.current.scrollLeft = 0;
       viewportRef.current.style.setProperty("--track-scroll", "0px");
@@ -640,6 +984,17 @@ export default function TimelineEditor({
     }
     audioUrlRef.current = initialAudioSourceUrl;
   }, [initialAudioSourceUrl]);
+
+  useEffect(() => {
+    if (
+      !requestedAudioFile ||
+      requestedAudioIdRef.current === requestedAudioFile.id
+    ) {
+      return;
+    }
+    requestedAudioIdRef.current = requestedAudioFile.id;
+    void loadAudio(requestedAudioFile.file).finally(onRequestedAudioHandled);
+  }, [requestedAudioFile?.id]);
 
   useEffect(() => {
     if (!audioRef.current) return;
@@ -800,7 +1155,10 @@ export default function TimelineEditor({
       const individualOutput = evaluateTrackAtPlayhead(fixtureTrack, playhead);
       output[fixture.id] = {
         intensity: isNeutralTrackData(fixtureTrack) ? groupOutput.intensity : individualOutput.intensity,
-        color: fixtureTrack?.colors.length ? individualOutput.color : groupOutput.color,
+        color:
+          fixtureTrack?.colors.length || fixtureTrack?.colorTransitions.length
+            ? individualOutput.color
+            : groupOutput.color,
         strobe: fixtureTrack?.strobes.length ? individualOutput.strobe : groupOutput.strobe,
       };
     });
@@ -840,23 +1198,188 @@ export default function TimelineEditor({
   ]);
 
   function updateTrack(fixtureId: string, data: TrackData) {
-    setTracks((previous) => {
-      undoStackRef.current.push(previous);
-      if (undoStackRef.current.length > 100) {
-        undoStackRef.current.shift();
-      }
-      return { ...previous, [fixtureId]: normalizeTrackData(data) };
-    });
+    undoStackRef.current.push({ tracks, duration, fixtureGroups });
+    if (undoStackRef.current.length > 100) undoStackRef.current.shift();
+    redoStackRef.current = [];
+    setTracks((previous) => ({
+      ...previous,
+      [fixtureId]: normalizeTrackData(data),
+    }));
   }
 
   function commitTracks(nextTracks: Record<string, TrackData>) {
-    setTracks((previous) => {
-      undoStackRef.current.push(previous);
-      if (undoStackRef.current.length > 100) {
-        undoStackRef.current.shift();
-      }
-      return nextTracks;
-    });
+    undoStackRef.current.push({ tracks, duration, fixtureGroups });
+    if (undoStackRef.current.length > 100) undoStackRef.current.shift();
+    redoStackRef.current = [];
+    setTracks(nextTracks);
+  }
+
+  function submitCueAssistantCommand() {
+    const input = cueAssistantInput.trim();
+    if (!input) return;
+    const userMessage: CueAssistantMessage = {
+      id: uid(),
+      role: "user",
+      text: input,
+    };
+
+    try {
+      const command = parseCueCommand(
+        input,
+        fixtures,
+        stagePlacements,
+        selectedFixtureIds,
+        playhead,
+      );
+      const nextDuration = Math.max(duration, Math.ceil(command.end + 1));
+      const nextTracks = { ...tracks };
+      const epsilon = Math.min(0.01, grid / 10);
+
+      command.fixtureIds.forEach((fixtureId) => {
+        const track = normalizeTrackData(nextTracks[fixtureId]);
+        const regionStart = command.start;
+        const regionEnd = command.end;
+        const overlapsRegion = (start: number, clipDuration: number) =>
+          start < regionEnd && start + clipDuration > regionStart;
+
+        let points = track.points;
+        if (command.intensity !== null && !command.intensityEffect) {
+          const beforeValue = evaluateTrackAtPlayhead(track, Math.max(0, regionStart - epsilon));
+          const afterValue = evaluateTrackAtPlayhead(track, Math.min(duration, regionEnd + epsilon));
+          points = [
+            ...track.points.filter(
+              (point) => point.time < regionStart - epsilon || point.time > regionEnd + epsilon,
+            ),
+            { time: Math.max(0, regionStart - epsilon), value: beforeValue.intensity },
+            { time: regionStart, value: command.intensity },
+            { time: regionEnd, value: command.intensity },
+            ...(regionEnd < nextDuration
+              ? [{ time: regionEnd + epsilon, value: afterValue.intensity }]
+              : []),
+          ];
+        }
+
+        const colors = command.color
+          ? [
+              ...track.colors.filter((clip) => !overlapsRegion(clip.start, clip.duration)),
+              {
+                id: uid(),
+                start: regionStart,
+                duration: regionEnd - regionStart,
+                color: command.color,
+              },
+            ]
+          : track.colors;
+        const colorTransitions =
+          command.transitionFromColor && command.transitionToColor
+            ? [
+                ...track.colorTransitions.filter(
+                  (transition) =>
+                    !overlapsRegion(transition.start, transition.duration),
+                ),
+                {
+                  id: uid(),
+                  start: regionStart,
+                  duration: regionEnd - regionStart,
+                  fromColor: command.transitionFromColor,
+                  toColor: command.transitionToColor,
+                },
+              ]
+            : track.colorTransitions;
+        const strobes = command.strobe !== null
+          ? [
+              ...track.strobes.filter((clip) => !overlapsRegion(clip.start, clip.duration)),
+              {
+                id: uid(),
+                start: regionStart,
+                duration: regionEnd - regionStart,
+                rate: command.strobe,
+              },
+            ]
+          : command.clearStrobe || command.intensityEffect === "pulse"
+            ? track.strobes.filter((clip) => !overlapsRegion(clip.start, clip.duration))
+            : track.strobes;
+
+        let nextTrack = normalizeTrackData({
+          ...track,
+          points,
+          colors,
+          colorTransitions,
+          strobes,
+          effects: command.intensityEffect
+            ? track.effects.filter((effect) => !overlapsRegion(effect.start, effect.duration))
+            : track.effects,
+        });
+
+        if (command.intensityEffect) {
+          const effectDuration = regionEnd - regionStart;
+          const effect: IntensityEffect = command.intensityEffect === "pulse"
+            ? {
+                id: uid(),
+                type: "pulse",
+                start: regionStart,
+                duration: effectDuration,
+                activeLength: command.pulseActiveLength,
+                spacingLength: command.pulseSpacingLength,
+                intensity: command.intensity ?? 1,
+              }
+            : {
+                id: uid(),
+                type: command.intensityEffect,
+                start: regionStart,
+                duration: effectDuration,
+                minIntensity: 0,
+                maxIntensity: command.intensity ?? 1,
+                length: effectDuration,
+              };
+          nextTrack = applyEffectToTrack(nextTrack, effect);
+        }
+
+        nextTracks[fixtureId] = nextTrack;
+      });
+
+      commitTracks(nextTracks);
+      if (nextDuration > duration) setDuration(nextDuration);
+      setPlayhead(command.start);
+      setSelectedFixtureIds(command.fixtureIds);
+      setSelectedFixtureId(command.fixtureIds[0] ?? selectedFixtureId);
+      const details = [
+        command.intensityEffect === "pulse" ? "intensity pulse" : "",
+        command.intensityEffect === "fade" ? "gradual fade out" : "",
+        command.intensityEffect === "rise" ? "gradual fade in" : "",
+        command.transitionFromColor && command.transitionToColor
+          ? `${command.transitionFromColor.toUpperCase()} → ${command.transitionToColor.toUpperCase()} color transition`
+          : "",
+        command.intensity !== null && !command.intensityEffect
+          ? `${Math.round(command.intensity * 100)}% intensity`
+          : "",
+        command.color ? command.color.toUpperCase() : "",
+        command.strobe !== null ? `${command.strobe} Hz strobe` : "",
+        command.clearStrobe ? "steady" : "",
+      ].filter(Boolean).join(", ");
+      setCueAssistantMessages((previous) => [
+        ...previous,
+        userMessage,
+        {
+          id: uid(),
+          role: "assistant",
+          tone: "success",
+          text: `Applied ${details} to ${command.fixtureIds.length} ${command.targetLabel} from ${clock(command.start)} to ${clock(command.end)}.`,
+        },
+      ]);
+      setCueAssistantInput("");
+    } catch (error) {
+      setCueAssistantMessages((previous) => [
+        ...previous,
+        userMessage,
+        {
+          id: uid(),
+          role: "assistant",
+          tone: "error",
+          text: error instanceof Error ? error.message : String(error),
+        },
+      ]);
+    }
   }
 
   function selectSingleFixture(fixtureId: string) {
@@ -882,6 +1405,9 @@ export default function TimelineEditor({
       name: `${leadFixture.name} Group`,
       fixtureIds: orderedSelection,
     };
+    undoStackRef.current.push({ tracks, duration, fixtureGroups });
+    if (undoStackRef.current.length > 100) undoStackRef.current.shift();
+    redoStackRef.current = [];
     setFixtureGroups((previous) => [...previous, group]);
     setTracks((previous) => {
       const next = { ...previous, [group.id]: previous[leadFixtureId] ?? makeDefaultTrackData() };
@@ -901,6 +1427,9 @@ export default function TimelineEditor({
       selectedFixtureId === group.id,
     );
     if (!groupsToRemove.length) return;
+    undoStackRef.current.push({ tracks, duration, fixtureGroups });
+    if (undoStackRef.current.length > 100) undoStackRef.current.shift();
+    redoStackRef.current = [];
     const groupIdsToRemove = new Set(groupsToRemove.map((group) => group.id));
     setFixtureGroups((previous) => previous.filter((group) => !groupIdsToRemove.has(group.id)));
     setExpandedGroupIds((previous) => previous.filter((groupId) => !groupIdsToRemove.has(groupId)));
@@ -914,6 +1443,7 @@ export default function TimelineEditor({
               curve: groupTrack.curve,
               points: groupTrack.points.map((point) => ({ ...point })),
               colors: groupTrack.colors.map((clip) => ({ ...clip })),
+              colorTransitions: groupTrack.colorTransitions.map((transition) => ({ ...transition })),
               strobes: groupTrack.strobes.map((clip) => ({ ...clip })),
               effects: groupTrack.effects.map((effect) => ({ ...effect })),
             };
@@ -931,8 +1461,37 @@ export default function TimelineEditor({
   function undoLastChange() {
     const previous = undoStackRef.current.pop();
     if (previous) {
-      setTracks(previous);
+      redoStackRef.current.push({ tracks, duration, fixtureGroups });
+      setTracks(previous.tracks);
+      setDuration(previous.duration);
+      setFixtureGroups(previous.fixtureGroups);
+      return true;
     }
+    return false;
+  }
+
+  function redoLastChange() {
+    const next = redoStackRef.current.pop();
+    if (next) {
+      undoStackRef.current.push({ tracks, duration, fixtureGroups });
+      setTracks(next.tracks);
+      setDuration(next.duration);
+      setFixtureGroups(next.fixtureGroups);
+      return true;
+    }
+    return false;
+  }
+
+  function addHistoryMessage(action: "Undid" | "Redid") {
+    setCueAssistantMessages((previous) => [
+      ...previous,
+      {
+        id: uid(),
+        role: "assistant",
+        tone: "success",
+        text: `${action} the last timeline change.`,
+      },
+    ]);
   }
 
   function applyEffectToTrack(track: TrackData, effect: IntensityEffect) {
@@ -1109,6 +1668,120 @@ export default function TimelineEditor({
     setEffectEditor(null);
   }
 
+  function openColorTransitionEditor(
+    fixtureId: string,
+    leftClipId: string,
+    rightClipId: string,
+  ) {
+    setColorTransitionEditor({
+      fixtureId,
+      leftClipId,
+      rightClipId,
+      duration: Math.max(0.1, grid),
+    });
+  }
+
+  function submitColorTransition() {
+    if (!colorTransitionEditor) return;
+    const track = tracks[colorTransitionEditor.fixtureId];
+    if (!track) return;
+    const leftClip = track.colors.find(
+      (clip) => clip.id === colorTransitionEditor.leftClipId,
+    );
+    const rightClip = track.colors.find(
+      (clip) => clip.id === colorTransitionEditor.rightClipId,
+    );
+    if (!leftClip || !rightClip) {
+      setColorTransitionEditor(null);
+      return;
+    }
+
+    const boundary = leftClip.start + leftClip.duration;
+    const maximumHalf = Math.max(
+      0,
+      Math.min(leftClip.duration - 0.05, rightClip.duration - 0.05),
+    );
+    const halfDuration = Math.min(
+      Math.max(0.05, colorTransitionEditor.duration / 2),
+      maximumHalf,
+    );
+    if (halfDuration <= 0) {
+      setColorTransitionEditor(null);
+      return;
+    }
+
+    const transition: ColorTransition = {
+      id: uid(),
+      start: boundary - halfDuration,
+      duration: halfDuration * 2,
+      fromColor: leftClip.color,
+      toColor: rightClip.color,
+      leftClipId: leftClip.id,
+      rightClipId: rightClip.id,
+      boundary,
+    };
+    updateTrack(colorTransitionEditor.fixtureId, {
+      ...track,
+      colors: track.colors.map((clip) => {
+        if (clip.id === leftClip.id) {
+          return { ...clip, duration: Math.max(0.05, clip.duration - halfDuration) };
+        }
+        if (clip.id === rightClip.id) {
+          return {
+            ...clip,
+            start: clip.start + halfDuration,
+            duration: Math.max(0.05, clip.duration - halfDuration),
+          };
+        }
+        return clip;
+      }),
+      colorTransitions: [...track.colorTransitions, transition].sort(
+        (a, b) => a.start - b.start,
+      ),
+    });
+    setColorTransitionEditor(null);
+  }
+
+  function copyTransitionFromContextMenu() {
+    if (!itemContextMenu || itemContextMenu.kind !== "colorTransition") return;
+    const transition = tracks[itemContextMenu.fixtureId]?.colorTransitions.find(
+      (item) => item.id === itemContextMenu.transitionId,
+    );
+    if (!transition) return;
+    setTransitionClipboard({
+      id: transition.id,
+      start: 0,
+      duration: transition.duration,
+      fromColor: transition.fromColor,
+      toColor: transition.toColor,
+    });
+    setItemContextMenu(null);
+  }
+
+  function pasteTransitionAtPlayhead() {
+    if (!transitionClipboard) return;
+    const fixtureId =
+      itemContextMenu?.fixtureId ?? selectedFixtureId;
+    const track = tracks[fixtureId];
+    if (!track) return;
+    updateTrack(fixtureId, {
+      ...track,
+      colorTransitions: [
+        ...track.colorTransitions,
+        {
+          ...transitionClipboard,
+          id: uid(),
+          start: Math.min(
+            Math.max(0, playhead),
+            Math.max(0, duration - transitionClipboard.duration),
+          ),
+        },
+      ].sort((a, b) => a.start - b.start),
+    });
+    setItemContextMenu(null);
+    setContextMenu(null);
+  }
+
   function deleteItemFromContextMenu() {
     if (!itemContextMenu) return;
     const track = tracks[itemContextMenu.fixtureId];
@@ -1122,6 +1795,35 @@ export default function TimelineEditor({
       if (selectedColorKey === `${itemContextMenu.fixtureId}:${itemContextMenu.clipId}`) {
         setSelectedColorKey(null);
       }
+    } else if (itemContextMenu.kind === "colorTransition") {
+      const transition = track.colorTransitions.find(
+        (item) => item.id === itemContextMenu.transitionId,
+      );
+      updateTrack(itemContextMenu.fixtureId, {
+        ...track,
+        colors: transition?.leftClipId && transition.rightClipId && transition.boundary !== undefined
+          ? track.colors.map((clip) => {
+              if (clip.id === transition.leftClipId) {
+                return {
+                  ...clip,
+                  duration: Math.max(0.05, transition.boundary! - clip.start),
+                };
+              }
+              if (clip.id === transition.rightClipId) {
+                const end = clip.start + clip.duration;
+                return {
+                  ...clip,
+                  start: transition.boundary!,
+                  duration: Math.max(0.05, end - transition.boundary!),
+                };
+              }
+              return clip;
+            })
+          : track.colors,
+        colorTransitions: track.colorTransitions.filter(
+          (transition) => transition.id !== itemContextMenu.transitionId,
+        ),
+      });
     } else if (itemContextMenu.kind === "strobe") {
       updateTrack(itemContextMenu.fixtureId, {
         ...track,
@@ -1150,6 +1852,19 @@ export default function TimelineEditor({
         .map((point) => ({ ...point, time: point.time - start })),
       colors: source.colors.filter((clip) => clip.start < end && clip.start + clip.duration > start)
         .map((clip) => ({ ...clip, id: uid(), start: Math.max(0, clip.start - start) })),
+      colorTransitions: source.colorTransitions
+        .filter(
+          (transition) =>
+            transition.start < end &&
+            transition.start + transition.duration > start,
+        )
+        .map((transition) => ({
+          id: uid(),
+          start: Math.max(0, transition.start - start),
+          duration: transition.duration,
+          fromColor: transition.fromColor,
+          toColor: transition.toColor,
+        })),
       strobes: source.strobes.filter((clip) => clip.start < end && clip.start + clip.duration > start)
         .map((clip) => ({ ...clip, id: uid(), start: Math.max(0, clip.start - start) })),
       effects: source.effects
@@ -1169,6 +1884,14 @@ export default function TimelineEditor({
         [...target.colors, ...clipboard.colors.map((clip) => ({ ...clip, id: uid(), start: clip.start + playhead }))],
         duration,
       ),
+      colorTransitions: [
+        ...target.colorTransitions,
+        ...clipboard.colorTransitions.map((transition) => ({
+          ...transition,
+          id: uid(),
+          start: transition.start + playhead,
+        })),
+      ],
       strobes: [...target.strobes, ...clipboard.strobes.map((clip) => ({ ...clip, id: uid(), start: clip.start + playhead }))],
       effects: [...target.effects, ...clipboard.effects.map((effect) => ({ ...effect, id: uid(), start: effect.start + playhead }))],
     });
@@ -1186,6 +1909,11 @@ export default function TimelineEditor({
         points: source.points.filter((point) => point.time < start || point.time > end),
         colors: source.colors.filter(
           (clip) => clip.start >= end || clip.start + clip.duration <= start,
+        ),
+        colorTransitions: source.colorTransitions.filter(
+          (transition) =>
+            transition.start >= end ||
+            transition.start + transition.duration <= start,
         ),
         strobes: source.strobes.filter(
           (clip) => clip.start >= end || clip.start + clip.duration <= start,
@@ -1242,7 +1970,7 @@ export default function TimelineEditor({
       audioRef.current.muted = false;
       audioRef.current.load();
     }
-    onAudioSourceChange({ name: file.name, url: audioUrlRef.current });
+    onAudioSourceChange({ name: file.name, url: audioUrlRef.current, file });
     try {
       const context = new AudioContext();
       const buffer = await context.decodeAudioData(await file.arrayBuffer());
@@ -1331,7 +2059,16 @@ export default function TimelineEditor({
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       setCtrlHeld(event.ctrlKey);
-      if (event.code === "Space" && !(event.target instanceof HTMLInputElement) && !(event.target instanceof HTMLSelectElement)) {
+      const key = event.key.toLowerCase();
+      const primaryModifier = event.ctrlKey || event.metaKey;
+      const target = event.target;
+      const isEditable =
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        (target instanceof HTMLElement && target.isContentEditable);
+
+      if (event.code === "Space" && !isEditable) {
         if (transportLockEnabled) {
           event.preventDefault();
           return;
@@ -1339,17 +2076,32 @@ export default function TimelineEditor({
         event.preventDefault();
         void togglePlayback();
       }
-      if (event.ctrlKey && event.key.toLowerCase() === "c") {
+      if (primaryModifier && key === "c" && !isEditable) {
         event.preventDefault();
         copySelection();
       }
-      if (event.ctrlKey && event.key.toLowerCase() === "v") {
+      if (primaryModifier && key === "v" && !isEditable) {
         event.preventDefault();
         pasteSelection();
       }
-      if (event.ctrlKey && event.key.toLowerCase() === "z") {
+      const wantsRedo =
+        primaryModifier && (key === "y" || (key === "z" && event.shiftKey));
+      const wantsUndo = primaryModifier && key === "z" && !event.shiftKey;
+      if (wantsUndo || wantsRedo) {
+        if (
+          isEditable &&
+          !(
+            target instanceof HTMLTextAreaElement &&
+            target.classList.contains("cueAssistantInput") &&
+            target.value.length === 0
+          )
+        ) {
+          return;
+        }
         event.preventDefault();
-        undoLastChange();
+        if (wantsRedo ? redoLastChange() : undoLastChange()) {
+          addHistoryMessage(wantsRedo ? "Redid" : "Undid");
+        }
       }
     };
     const onKeyUp = (event: KeyboardEvent) => setCtrlHeld(event.ctrlKey);
@@ -1556,6 +2308,41 @@ export default function TimelineEditor({
             </button>
           </div>
           <button className="librarySection">Presets <small>SOON</small></button>
+          <section className="cueAssistant" aria-label="AI cue assistant">
+            <div className="cueAssistantHeader">
+              <span>AI CUE ASSISTANT</span>
+              <small>LOCAL</small>
+            </div>
+            <div className="cueAssistantMessages" aria-live="polite">
+              {cueAssistantMessages.slice(-4).map((message) => (
+                <p
+                  key={message.id}
+                  className={`${message.role} ${message.tone ?? ""}`}
+                >
+                  {message.text}
+                </p>
+              ))}
+            </div>
+            <textarea
+              className="cueAssistantInput"
+              value={cueAssistantInput}
+              onChange={(event) => setCueAssistantInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" || event.shiftKey) return;
+                event.preventDefault();
+                submitCueAssistantCommand();
+              }}
+              placeholder="Make the front lights blue at 10s..."
+              rows={3}
+            />
+            <button
+              className="cueAssistantSend"
+              disabled={!cueAssistantInput.trim()}
+              onClick={submitCueAssistantCommand}
+            >
+              Create cue
+            </button>
+          </section>
         </aside>
 
         <section className="editorMain">
@@ -1672,6 +2459,7 @@ export default function TimelineEditor({
                     selectedEffectKey={selectedEffectKey}
                     selectedColorKey={selectedColorKey}
                     onSelectColorClip={setSelectedColorKey}
+                    onRequestColorTransition={openColorTransitionEditor}
                     onSelectEffect={openEditEffectDialog}
                     onOpenItemContextMenu={setItemContextMenu}
                     onSelect={() => selectSingleFixture(item.fixture.id)}
@@ -1726,6 +2514,7 @@ export default function TimelineEditor({
                     selectedEffectKey={selectedEffectKey}
                     selectedColorKey={selectedColorKey}
                     onSelectColorClip={setSelectedColorKey}
+                    onRequestColorTransition={openColorTransitionEditor}
                     onSelectEffect={openEditEffectDialog}
                     onOpenItemContextMenu={setItemContextMenu}
                     onSelect={() => selectFixtureGroup(item.group)}
@@ -1789,6 +2578,31 @@ export default function TimelineEditor({
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onPointerDown={(event) => event.stopPropagation()}
         >
+          <button
+            disabled={!undoStackRef.current.length}
+            onClick={() => {
+              if (undoLastChange()) addHistoryMessage("Undid");
+              setContextMenu(null);
+            }}
+          >
+            Undo <small>Ctrl+Z</small>
+          </button>
+          <button
+            disabled={!redoStackRef.current.length}
+            onClick={() => {
+              if (redoLastChange()) addHistoryMessage("Redid");
+              setContextMenu(null);
+            }}
+          >
+            Redo <small>Ctrl+Y</small>
+          </button>
+          <button
+            disabled={!transitionClipboard || !selectedFixtureId}
+            onClick={pasteTransitionAtPlayhead}
+          >
+            Paste transition
+          </button>
+          <hr />
           <button disabled={!selections.length} onClick={() => { copySelection(); setContextMenu(null); }}>
             Copy
           </button>
@@ -1806,9 +2620,101 @@ export default function TimelineEditor({
           style={{ left: itemContextMenu.x, top: itemContextMenu.y }}
           onPointerDown={(event) => event.stopPropagation()}
         >
+          <button
+            type="button"
+            disabled={!undoStackRef.current.length}
+            onClick={() => {
+              if (undoLastChange()) addHistoryMessage("Undid");
+              setItemContextMenu(null);
+            }}
+          >
+            Undo
+          </button>
+          <button
+            type="button"
+            disabled={!redoStackRef.current.length}
+            onClick={() => {
+              if (redoLastChange()) addHistoryMessage("Redid");
+              setItemContextMenu(null);
+            }}
+          >
+            Redo
+          </button>
+          {itemContextMenu.kind === "colorTransition" ? (
+            <button type="button" onClick={copyTransitionFromContextMenu}>
+              Copy transition
+            </button>
+          ) : null}
+          <button
+            type="button"
+            disabled={!transitionClipboard}
+            onClick={pasteTransitionAtPlayhead}
+          >
+            Paste transition
+          </button>
+          <hr />
           <button type="button" onClick={deleteItemFromContextMenu}>
             Delete
           </button>
+        </div>
+      ) : null}
+      {colorTransitionEditor ? (
+        <div
+          className="effectDialogBackdrop"
+          onPointerDown={() => setColorTransitionEditor(null)}
+        >
+          <div
+            className="effectDialog colorTransitionDialog"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <div className="effectDialogHeader">
+              <div>
+                <strong>Add color transition</strong>
+                <span>Blend smoothly between the two touching colors.</span>
+              </div>
+              <button type="button" onClick={() => setColorTransitionEditor(null)}>
+                Ã—
+              </button>
+            </div>
+            <label>
+              Transition duration
+              <div className="transitionDurationInput">
+                <input
+                  type="number"
+                  min="0.1"
+                  max="30"
+                  step="0.1"
+                  value={colorTransitionEditor.duration}
+                  onChange={(event) =>
+                    setColorTransitionEditor((previous) =>
+                      previous
+                        ? {
+                            ...previous,
+                            duration: Math.max(0.1, Number(event.target.value)),
+                          }
+                        : previous
+                    )
+                  }
+                />
+                <span>seconds</span>
+              </div>
+            </label>
+            <div className="effectDialogActions">
+              <span />
+              <div>
+                <button type="button" onClick={() => setColorTransitionEditor(null)}>
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="primaryButton"
+                  onClick={submitColorTransition}
+                >
+                  Add transition
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       ) : null}
       {effectEditor ? (
@@ -1986,7 +2892,7 @@ function TimeRuler({ duration, zoom, width }: { duration: number; zoom: number; 
 }
 
 function FixtureTrack({ fixture, data, zoom, grid, duration, width, selected, selection,
-  beatTimes, onSelect, onSelection, onChange, onMoveFixture, onPan, onPreviewColorChange, selectedEffectKey, selectedColorKey, onSelectColorClip, onSelectEffect, onOpenItemContextMenu }: {
+  beatTimes, onSelect, onSelection, onChange, onMoveFixture, onPan, onPreviewColorChange, selectedEffectKey, selectedColorKey, onSelectColorClip, onRequestColorTransition, onSelectEffect, onOpenItemContextMenu }: {
   fixture: PatchedFixture; data?: TrackData; zoom: number; grid: number; duration: number; width: number;
   beatTimes: number[];
   selected: boolean; selection: Selection | null; onSelect: () => void;
@@ -1996,6 +2902,7 @@ function FixtureTrack({ fixture, data, zoom, grid, duration, width, selected, se
   selectedEffectKey: string | null;
   selectedColorKey: string | null;
   onSelectColorClip: (key: string) => void;
+  onRequestColorTransition: (fixtureId: string, leftClipId: string, rightClipId: string) => void;
   onSelectEffect: (fixtureId: string, effect: IntensityEffect) => void;
   onOpenItemContextMenu: (menu: ItemContextMenuState) => void;
 }) {
@@ -2096,12 +3003,13 @@ function FixtureTrack({ fixture, data, zoom, grid, duration, width, selected, se
         onPan={onPan}
       />
       <div className="parameterDivider"><span>FIXTURE PARAMETERS</span></div>
-      <ColorLane clips={data.colors} zoom={zoom} grid={grid} duration={duration} width={width} beatTimes={beatTimes}
-        onChange={(colors) => onChange({ ...data, colors })}
+      <ColorLane clips={data.colors} transitions={data.colorTransitions} zoom={zoom} grid={grid} duration={duration} width={width} beatTimes={beatTimes}
+        onChange={(colors, colorTransitions) => onChange({ ...data, colors, colorTransitions })}
         onPreviewColorChange={onPreviewColorChange}
         fixtureId={fixture.id}
         selectedColorKey={selectedColorKey}
         onSelectColorClip={onSelectColorClip}
+        onRequestColorTransition={onRequestColorTransition}
         onOpenItemContextMenu={onOpenItemContextMenu} />
       <StrobeLane fixtureId={fixture.id} clips={data.strobes} zoom={zoom} grid={grid} duration={duration} width={width} beatTimes={beatTimes}
         onChange={(strobes) => onChange({ ...data, strobes })}
@@ -2139,6 +3047,7 @@ function GroupedFixtureTrack({
   selectedEffectKey,
   selectedColorKey,
   onSelectColorClip,
+  onRequestColorTransition,
   onSelectEffect,
   onOpenItemContextMenu,
   onSelect,
@@ -2169,6 +3078,7 @@ function GroupedFixtureTrack({
   selectedEffectKey: string | null;
   selectedColorKey: string | null;
   onSelectColorClip: (key: string) => void;
+  onRequestColorTransition: (fixtureId: string, leftClipId: string, rightClipId: string) => void;
   onSelectEffect: (fixtureId: string, effect: IntensityEffect) => void;
   onOpenItemContextMenu: (menu: ItemContextMenuState) => void;
   onSelect: () => void;
@@ -2214,12 +3124,13 @@ function GroupedFixtureTrack({
           onPan={onPan}
         />
         <div className="parameterDivider"><span>FIXTURE PARAMETERS</span></div>
-        <ColorLane clips={data.colors} zoom={zoom} grid={grid} duration={duration} width={width} beatTimes={beatTimes}
-          onChange={(colors) => onChange({ ...data, colors })}
+        <ColorLane clips={data.colors} transitions={data.colorTransitions} zoom={zoom} grid={grid} duration={duration} width={width} beatTimes={beatTimes}
+          onChange={(colors, colorTransitions) => onChange({ ...data, colors, colorTransitions })}
           onPreviewColorChange={onPreviewColorChange}
           fixtureId={group.id}
           selectedColorKey={selectedColorKey}
           onSelectColorClip={onSelectColorClip}
+          onRequestColorTransition={onRequestColorTransition}
           onOpenItemContextMenu={onOpenItemContextMenu} />
         <StrobeLane fixtureId={group.id} clips={data.strobes} zoom={zoom} grid={grid} duration={duration} width={width} beatTimes={beatTimes}
           onChange={(strobes) => onChange({ ...data, strobes })}
@@ -2255,6 +3166,7 @@ function GroupedFixtureTrack({
               selectedEffectKey={selectedEffectKey}
               selectedColorKey={selectedColorKey}
               onSelectColorClip={onSelectColorClip}
+              onRequestColorTransition={onRequestColorTransition}
               onSelectEffect={onSelectEffect}
               onOpenItemContextMenu={onOpenItemContextMenu}
               onSelect={() => onChildSelect(fixture.id)}
@@ -2413,18 +3325,29 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
   </div>;
 }
 
-function ColorLane({ fixtureId, clips, zoom, grid, duration, width, beatTimes, onChange, onPreviewColorChange, selectedColorKey, onSelectColorClip, onOpenItemContextMenu }: {
+function ColorLane({ fixtureId, clips, transitions, zoom, grid, duration, width, beatTimes, onChange, onPreviewColorChange, selectedColorKey, onSelectColorClip, onRequestColorTransition, onOpenItemContextMenu }: {
   fixtureId: string;
   clips: ColorClip[]; zoom: number; grid: number; duration: number; width: number;
+  transitions: ColorTransition[];
   beatTimes: number[];
-  onChange: (clips: ColorClip[]) => void;
+  onChange: (clips: ColorClip[], transitions: ColorTransition[]) => void;
   onPreviewColorChange: (color: string | null) => void;
   selectedColorKey: string | null;
   onSelectColorClip: (key: string) => void;
+  onRequestColorTransition: (fixtureId: string, leftClipId: string, rightClipId: string) => void;
   onOpenItemContextMenu: (menu: ItemContextMenuState) => void;
 }) {
   const lastEnd = clips.reduce((end, clip) => Math.max(end, clip.start + clip.duration), 0);
-  const commit = (next: ColorClip[]) => onChange(rippleColors(next, duration));
+  const sortedClips = [...clips].sort((a, b) => a.start - b.start);
+  const touchingBoundaries = sortedClips.slice(0, -1).flatMap((leftClip, index) => {
+    const rightClip = sortedClips[index + 1];
+    const boundary = leftClip.start + leftClip.duration;
+    return Math.abs(boundary - rightClip.start) <= 0.01
+      ? [{ leftClip, rightClip, boundary }]
+      : [];
+  });
+  const commit = (next: ColorClip[]) =>
+    onChange(rippleColors(next, duration), transitions);
   return <div className="parameterLane colorLane" style={{ width }}>
     <LaneBeatLines beatTimes={beatTimes} zoom={zoom} />
     <span>COLOR</span>
@@ -2444,6 +3367,48 @@ function ColorLane({ fixtureId, clips, zoom, grid, duration, width, beatTimes, o
         onSelect={() => onSelectColorClip(`${fixtureId}:${clip.id}`)}
         onOpenItemContextMenu={onOpenItemContextMenu}
       />
+    ))}
+    {transitions.map((transition) => (
+      <button
+        key={transition.id}
+        type="button"
+        className="colorTransitionBlock"
+        style={{
+          left: transition.start * zoom,
+          width: Math.max(24, transition.duration * zoom),
+          background: `linear-gradient(90deg, ${transition.fromColor}, ${transition.toColor})`,
+        }}
+        title={`${transition.duration.toFixed(1)} second color transition`}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onOpenItemContextMenu({
+            kind: "colorTransition",
+            x: event.clientX,
+            y: event.clientY,
+            fixtureId,
+            transitionId: transition.id,
+          });
+        }}
+      >
+        <strong>TRANSITION</strong>
+        <span>{transition.duration.toFixed(1)}s</span>
+      </button>
+    ))}
+    {touchingBoundaries.map(({ leftClip, rightClip, boundary }) => (
+      <button
+        type="button"
+        key={`${leftClip.id}:${rightClip.id}`}
+        className="colorTransitionBoundary"
+        style={{ left: boundary * zoom }}
+        aria-label="Add color transition"
+        onClick={(event) => {
+          event.stopPropagation();
+          onRequestColorTransition(fixtureId, leftClip.id, rightClip.id);
+        }}
+      >
+        <span>+ Color transition</span>
+      </button>
     ))}
     <button className="addColorButton" style={{ left: lastEnd * zoom + 6 }} disabled={lastEnd >= duration}
       onClick={() => commit([...clips, { id: uid(), start: snap(lastEnd, grid),
@@ -2480,16 +3445,16 @@ const ColorClipBlock = memo(function ColorClipBlock({
 }) {
   const blockRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const previewFrameRef = useRef<number | null>(null);
+  const previewTimerRef = useRef<number | null>(null);
   const pendingPreviewColorRef = useRef<string | null>(null);
 
   const flushPreviewColor = (color: string | null) => {
     pendingPreviewColorRef.current = color;
-    if (previewFrameRef.current !== null) return;
-    previewFrameRef.current = requestAnimationFrame(() => {
-      previewFrameRef.current = null;
+    if (previewTimerRef.current !== null) return;
+    previewTimerRef.current = window.setTimeout(() => {
+      previewTimerRef.current = null;
       onPreviewColorChange(pendingPreviewColorRef.current);
-    });
+    }, 75);
   };
 
   useEffect(() => {
@@ -2502,8 +3467,8 @@ const ColorClipBlock = memo(function ColorClipBlock({
   }, [clip.color]);
 
   useEffect(() => () => {
-    if (previewFrameRef.current !== null) {
-      cancelAnimationFrame(previewFrameRef.current);
+    if (previewTimerRef.current !== null) {
+      window.clearTimeout(previewTimerRef.current);
     }
   }, []);
 

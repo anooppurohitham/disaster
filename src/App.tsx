@@ -3,13 +3,22 @@ import type { CSSProperties, WheelEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
-import TimelineEditor, { type TimelineDocumentData } from "./TimelineEditor";
+import TimelineEditor, {
+  interpolateHexColor,
+  type TimelineDocumentData,
+} from "./TimelineEditor";
 import disasterLogo from "./assets/disaster-logo.png";
 import packageInfo from "../package.json";
 
 type SerialPortDto = {
   portName: string;
   portType: string;
+};
+
+type ArtNetNodeDto = {
+  ipAddress: string;
+  shortName: string;
+  longName: string;
 };
 
 type FixtureChannel = {
@@ -73,6 +82,16 @@ type StageUndoSnapshot = {
 type StageAudioSource = {
   name: string;
   url: string;
+  file?: File;
+};
+
+type RecentFileKind = "project" | "audio";
+
+type RecentFileEntry = {
+  id: string;
+  name: string;
+  openedAt: number;
+  size: number;
 };
 
 type UpdateCheckResult = {
@@ -192,6 +211,60 @@ const COMMON_CHANNEL_PRESETS = [
 ] as const;
 
 const PROGRAM_CUSTOM_MODES_STORAGE_KEY = "disaster.programCustomFixtureModes.v1";
+const RECENT_PROJECTS_STORAGE_KEY = "disaster.recentProjects.v1";
+const RECENT_AUDIO_STORAGE_KEY = "disaster.recentAudio.v1";
+const RECENT_FILES_DATABASE = "disaster-recent-files";
+const RECENT_FILES_STORE = "files";
+const MAX_RECENT_FILES = 6;
+const ARTNET_ENABLED_STORAGE_KEY = "disaster.artnetEnabled.v1";
+
+function readRecentFiles(storageKey: string): RecentFileEntry[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(storageKey) ?? "[]");
+    return Array.isArray(value) ? value.slice(0, MAX_RECENT_FILES) : [];
+  } catch {
+    return [];
+  }
+}
+
+function openRecentFilesDatabase() {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(RECENT_FILES_DATABASE, 1);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(RECENT_FILES_STORE)) {
+        database.createObjectStore(RECENT_FILES_STORE);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function storeRecentFile(id: string, file: File) {
+  const database = await openRecentFilesDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(RECENT_FILES_STORE, "readwrite");
+    transaction.objectStore(RECENT_FILES_STORE).put(file, id);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+  database.close();
+}
+
+async function readStoredRecentFile(id: string) {
+  const database = await openRecentFilesDatabase();
+  const file = await new Promise<File | null>((resolve, reject) => {
+    const request = database
+      .transaction(RECENT_FILES_STORE, "readonly")
+      .objectStore(RECENT_FILES_STORE)
+      .get(id);
+    request.onsuccess = () => resolve(request.result instanceof File ? request.result : null);
+    request.onerror = () => reject(request.error);
+  });
+  database.close();
+  return file;
+}
 
 let customFixtureModes: FixtureMode[] = [];
 
@@ -246,6 +319,15 @@ function getPreferredDmxPort(ports: SerialPortDto[]) {
   );
 }
 
+function getArtNetDeviceId(node: ArtNetNodeDto) {
+  return `artnet:${node.ipAddress}`;
+}
+
+function getArtNetNodeLabel(node: ArtNetNodeDto) {
+  const name = node.shortName || node.longName || "Art-Net Node";
+  return `${name} — ${node.ipAddress}`;
+}
+
 function ensureDstrFilename(name: string) {
   return name.toLowerCase().endsWith(".dstr") ? name : `${name}.dstr`;
 }
@@ -283,9 +365,17 @@ function normalizeStageName(value: string) {
 }
 
 function App() {
-  const [page, setPage] = useState<"app" | "patch" | "timeline" | "stage">("patch");
+  const [page, setPage] = useState<"app" | "patch" | "timeline" | "stage">("app");
   const [ports, setPorts] = useState<SerialPortDto[]>([]);
+  const [artNetNodes, setArtNetNodes] = useState<ArtNetNodeDto[]>([]);
+  const [artNetEnabled, setArtNetEnabled] = useState(
+    () => localStorage.getItem(ARTNET_ENABLED_STORAGE_KEY) === "true",
+  );
   const [selectedPort, setSelectedPort] = useState("");
+  const [selectedOutputIds, setSelectedOutputIds] = useState<string[]>([]);
+  const [artNetUniverse, setArtNetUniverse] = useState(0);
+  const [connectionKind, setConnectionKind] =
+    useState<"usb" | "artnet" | "mixed" | null>(null);
   const [connected, setConnected] = useState(false);
   const [channels, setChannels] = useState<number[]>(Array(512).fill(0));
   const [status, setStatus] = useState("Not connected");
@@ -293,6 +383,8 @@ function App() {
   const sendTimerRef = useRef<number | null>(null);
   const connectedRef = useRef(false);
   const connectedPortRef = useRef("");
+  const selectedOutputIdsRef = useRef<string[]>([]);
+  const artNetEnabledRef = useRef(artNetEnabled);
   const autoConnectingRef = useRef(false);
   const manuallyDisconnectedPortRef = useRef("");
   const [liveOutput, setLiveOutput] = useState(false);
@@ -304,6 +396,16 @@ function App() {
   const [customModes, setCustomModes] = useState<FixtureMode[]>([]);
   const [programCustomModes, setProgramCustomModes] = useState<FixtureMode[]>([]);
   const [stageAudioSources, setStageAudioSources] = useState<Record<string, StageAudioSource | null>>({});
+  const [recentProjects, setRecentProjects] = useState<RecentFileEntry[]>(() =>
+    readRecentFiles(RECENT_PROJECTS_STORAGE_KEY),
+  );
+  const [recentAudio, setRecentAudio] = useState<RecentFileEntry[]>(() =>
+    readRecentFiles(RECENT_AUDIO_STORAGE_KEY),
+  );
+  const [requestedAudioFile, setRequestedAudioFile] = useState<{
+    id: string;
+    file: File;
+  } | null>(null);
   const [fixtureSearchQuery, setFixtureSearchQuery] = useState("");
   const [oflIndex, setOflIndex] = useState<OflSearchEntry[]>([]);
   const [oflLoading, setOflLoading] = useState(false);
@@ -514,11 +616,59 @@ function App() {
     setStatus(`Opened ${filename ?? "project"}.`);
   }
 
+  async function rememberRecentFile(kind: RecentFileKind, file: File) {
+    const id = `${kind}:${file.name.trim().toLowerCase()}`;
+    const entry: RecentFileEntry = {
+      id,
+      name: file.name,
+      openedAt: Date.now(),
+      size: file.size,
+    };
+    try {
+      await storeRecentFile(id, file);
+      const storageKey =
+        kind === "project" ? RECENT_PROJECTS_STORAGE_KEY : RECENT_AUDIO_STORAGE_KEY;
+      const setter = kind === "project" ? setRecentProjects : setRecentAudio;
+      setter((previous) => {
+        const next = [entry, ...previous.filter((item) => item.id !== id)].slice(
+          0,
+          MAX_RECENT_FILES,
+        );
+        localStorage.setItem(storageKey, JSON.stringify(next));
+        return next;
+      });
+    } catch (error) {
+      setStatus(`Could not save ${file.name} to recents: ${String(error)}`);
+    }
+  }
+
+  async function openRecentProject(entry: RecentFileEntry) {
+    try {
+      const file = await readStoredRecentFile(entry.id);
+      if (!file) throw new Error("The stored project copy is no longer available.");
+      await openProjectFromFile(file);
+    } catch (error) {
+      setStatus(`Recent project error: ${String(error)}`);
+    }
+  }
+
+  async function openRecentAudioFile(entry: RecentFileEntry) {
+    try {
+      const file = await readStoredRecentFile(entry.id);
+      if (!file) throw new Error("The stored audio copy is no longer available.");
+      setRequestedAudioFile({ id: `${entry.id}:${Date.now()}`, file });
+      setPage("timeline");
+    } catch (error) {
+      setStatus(`Recent audio error: ${String(error)}`);
+    }
+  }
+
   async function openProjectFromFile(file: File, handle?: any) {
     try {
       const text = await file.text();
       const parsed = JSON.parse(text) as LegacyShowDocument;
       applyOpenedProject(parsed, file.name, handle);
+      void rememberRecentFile("project", file);
     } catch (err) {
       setStatus(`Open error: ${String(err)}`);
     } finally {
@@ -1107,24 +1257,51 @@ function clearFixture(fixture: PatchedFixture) {
 }
 
 
-  async function connectToPort(portName: string) {
-    if (!portName || connectedRef.current || autoConnectingRef.current) return;
+  async function connectToOutputs(outputIds: string[]) {
+    const uniqueOutputs = Array.from(new Set(outputIds)).filter(
+      (id) => Boolean(id) && (artNetEnabledRef.current || !id.startsWith("artnet:")),
+    );
+    if (!uniqueOutputs.length || autoConnectingRef.current) return;
 
     autoConnectingRef.current = true;
-    let portOpened = false;
+    let outputsOpened = false;
     try {
-      setSelectedPort(portName);
-      await invoke("connect_dmx", { portName });
-      portOpened = true;
+      await invoke("disconnect_dmx");
+      const usbOutput = uniqueOutputs.find((id) => !id.startsWith("artnet:"));
+      const artNetOutputs = uniqueOutputs.filter((id) => id.startsWith("artnet:"));
+      if (usbOutput) {
+        await invoke("connect_dmx", { portName: usbOutput });
+      }
+      for (const outputId of artNetOutputs) {
+        await invoke("connect_artnet", {
+          ipAddress: outputId.slice("artnet:".length),
+          universe: artNetUniverse,
+        });
+      }
+      outputsOpened = true;
       await invoke("send_dmx", { channels: latestChannelsRef.current });
       await invoke("set_live_output", { enabled: true });
       connectedRef.current = true;
-      connectedPortRef.current = portName;
+      connectedPortRef.current = uniqueOutputs.join("|");
+      selectedOutputIdsRef.current = uniqueOutputs;
+      setSelectedOutputIds(uniqueOutputs);
+      setSelectedPort(uniqueOutputs[0]);
       setConnected(true);
       setLiveOutput(true);
-      setStatus(`Connected to ${portName}; live output enabled.`);
+      const nextKind =
+        usbOutput && artNetOutputs.length
+          ? "mixed"
+          : usbOutput
+            ? "usb"
+            : "artnet";
+      setConnectionKind(nextKind);
+      setStatus(
+        `Connected to ${uniqueOutputs.length} DMX output${uniqueOutputs.length === 1 ? "" : "s"}${
+          artNetOutputs.length ? ` · Art-Net universe ${artNetUniverse}` : ""
+        }; live output enabled.`,
+      );
     } catch (err) {
-      if (portOpened) {
+      if (outputsOpened) {
         try {
           await invoke("disconnect_dmx");
         } catch {
@@ -1135,6 +1312,7 @@ function clearFixture(fixture: PatchedFixture) {
       connectedPortRef.current = "";
       setConnected(false);
       setLiveOutput(false);
+      setConnectionKind(null);
       setStatus(`Connection error: ${String(err)}`);
     } finally {
       autoConnectingRef.current = false;
@@ -1143,48 +1321,83 @@ function clearFixture(fixture: PatchedFixture) {
 
   async function refreshPorts() {
     try {
-      const result = await invoke<SerialPortDto[]>("list_serial_ports");
+      const [result, nodes] = await Promise.all([
+        invoke<SerialPortDto[]>("list_serial_ports"),
+        artNetEnabledRef.current
+          ? invoke<ArtNetNodeDto[]>("discover_artnet_nodes").catch(() => [])
+          : Promise.resolve([]),
+      ]);
       setPorts(result);
+      setArtNetNodes(nodes);
+      const availableIds = [
+        ...result.map((port) => port.portName),
+        ...nodes.map(getArtNetDeviceId),
+      ];
+      const connectedIds = connectedPortRef.current
+        .split("|")
+        .filter(Boolean);
 
       if (
         connectedRef.current &&
-        !result.some((port) => port.portName === connectedPortRef.current)
+        connectedIds.some(
+          (id) => !id.startsWith("artnet:") && !availableIds.includes(id),
+        )
       ) {
         await invoke("disconnect_dmx");
         connectedRef.current = false;
         connectedPortRef.current = "";
         setConnected(false);
         setLiveOutput(false);
+        setConnectionKind(null);
         setStatus("USB-DMX device disconnected.");
       }
 
-      if (
-        manuallyDisconnectedPortRef.current &&
-        !result.some(
-          (port) => port.portName === manuallyDisconnectedPortRef.current,
-        )
-      ) {
-        manuallyDisconnectedPortRef.current = "";
-      }
-
-      if (result.length === 0) {
-        setStatus("No serial devices found. Plug in your USB-DMX adapter.");
-        return;
-      }
-
       const preferredPort = getPreferredDmxPort(result);
-      setSelectedPort(
-        (current) => current || preferredPort?.portName || result[0].portName,
+      const preferredDevice =
+        preferredPort?.portName ??
+        (result.length ? result[0].portName : nodes[0] ? getArtNetDeviceId(nodes[0]) : "");
+      const retainedSelection = selectedOutputIdsRef.current.filter((id) =>
+        availableIds.includes(id),
       );
+      const nextSelection = retainedSelection.length
+        ? retainedSelection
+        : preferredDevice
+          ? [preferredDevice]
+          : [];
+      selectedOutputIdsRef.current = nextSelection;
+      setSelectedOutputIds(nextSelection);
+      setSelectedPort(nextSelection[0] ?? "");
 
       if (
         preferredPort &&
-        !connectedRef.current &&
-        manuallyDisconnectedPortRef.current !== preferredPort.portName
+        connectedRef.current &&
+        !connectedIds.some((id) => !id.startsWith("artnet:"))
       ) {
-        await connectToPort(preferredPort.portName);
+        const retainedArtNet = connectedIds.filter(
+          (id) => id.startsWith("artnet:") && availableIds.includes(id),
+        );
+        await connectToOutputs([preferredPort.portName, ...retainedArtNet]);
+        return;
+      }
+
+      if (
+        !connectedRef.current &&
+        !manuallyDisconnectedPortRef.current &&
+        nextSelection.length
+      ) {
+        await connectToOutputs(nextSelection);
       } else if (!connectedRef.current) {
-        setStatus(`Found ${result.length} serial device(s).`);
+        if (!result.length && !nodes.length) {
+          setStatus(
+            artNetEnabledRef.current
+              ? "No USB DMX or Art-Net devices found."
+              : "No USB DMX devices found. Art-Net is off.",
+          );
+        } else {
+          setStatus(
+            `Found ${result.length} serial and ${nodes.length} Art-Net device(s).`,
+          );
+        }
       }
     } catch (err) {
       setStatus(`Error listing ports: ${String(err)}`);
@@ -1193,17 +1406,51 @@ function clearFixture(fixture: PatchedFixture) {
 
   async function connect() {
     manuallyDisconnectedPortRef.current = "";
-    await connectToPort(selectedPort);
+    await connectToOutputs(selectedOutputIdsRef.current);
+  }
+
+  async function setArtNetOutputEnabled(enabled: boolean) {
+    artNetEnabledRef.current = enabled;
+    setArtNetEnabled(enabled);
+    localStorage.setItem(ARTNET_ENABLED_STORAGE_KEY, String(enabled));
+
+    if (enabled) {
+      void refreshPorts();
+      return;
+    }
+
+    setArtNetNodes([]);
+    const usbOutputs = selectedOutputIdsRef.current.filter(
+      (id) => !id.startsWith("artnet:"),
+    );
+    selectedOutputIdsRef.current = usbOutputs;
+    setSelectedOutputIds(usbOutputs);
+    setSelectedPort(usbOutputs[0] ?? "");
+
+    if (!connectedRef.current) return;
+    if (usbOutputs.length) {
+      await connectToOutputs(usbOutputs);
+      return;
+    }
+
+    await invoke("disconnect_dmx");
+    connectedRef.current = false;
+    connectedPortRef.current = "";
+    setConnected(false);
+    setLiveOutput(false);
+    setConnectionKind(null);
+    setStatus("Art-Net disabled; no USB DMX output is selected.");
   }
 
   async function disconnect() {
     try {
       await invoke("disconnect_dmx");
-      manuallyDisconnectedPortRef.current = selectedPort;
+      manuallyDisconnectedPortRef.current = "manual";
       connectedRef.current = false;
       connectedPortRef.current = "";
       setConnected(false);
       setLiveOutput(false);
+      setConnectionKind(null);
       setStatus("Disconnected");
     } catch (err) {
       setStatus(`Disconnect error: ${String(err)}`);
@@ -1348,6 +1595,9 @@ function clearFixture(fixture: PatchedFixture) {
       ...previous,
       [activeStageId]: audio,
     }));
+    if (audio?.file) {
+      void rememberRecentFile("audio", audio.file);
+    }
   }
 
   useEffect(() => {
@@ -1380,7 +1630,7 @@ function clearFixture(fixture: PatchedFixture) {
 
   useEffect(() => {
     refreshPorts();
-    const refreshTimer = window.setInterval(refreshPorts, 1000);
+    const refreshTimer = window.setInterval(refreshPorts, 2500);
 
     return () => window.clearInterval(refreshTimer);
   }, []);
@@ -1446,7 +1696,7 @@ function clearFixture(fixture: PatchedFixture) {
         return;
       }
 
-      if (!event.ctrlKey || key !== "z") return;
+      if (page !== "stage" || !primaryModifier || key !== "z") return;
       if (
         event.target instanceof HTMLInputElement ||
         event.target instanceof HTMLTextAreaElement ||
@@ -1460,7 +1710,7 @@ function clearFixture(fixture: PatchedFixture) {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [stages, activeStageId]);
+  }, [page, stages, activeStageId]);
 
   useEffect(() => {
     const title = isDirty
@@ -1559,7 +1809,13 @@ function clearFixture(fixture: PatchedFixture) {
           <div className={`connectionBadge ${connected && liveOutput ? "isLive" : ""}`}>
           <span className="connectionLight" />
           <span>
-            <strong>USB DMX</strong>
+            <strong>
+              {connectionKind === "mixed"
+                ? "USB + ART-NET"
+                : connectionKind === "artnet" || selectedPort.startsWith("artnet:")
+                  ? "ART-NET"
+                  : "USB DMX"}
+            </strong>
             <small>{connected && liveOutput ? "Connected · Live" : "Offline"}</small>
           </span>
           </div>
@@ -1581,6 +1837,73 @@ function clearFixture(fixture: PatchedFixture) {
             <small>Current version</small>
             <strong>{packageInfo.version}</strong>
           </div>
+        </section>
+
+        <section className="appRecentGrid">
+          <article className="appRecentPanel">
+            <div className="appRecentHeader">
+              <div>
+                <small>RECENTLY OPENED</small>
+                <h2>Projects</h2>
+              </div>
+              <button onClick={() => void openProject()}>Open project</button>
+            </div>
+            <div className="appRecentList">
+              {recentProjects.length ? (
+                recentProjects.map((entry) => (
+                  <button
+                    key={entry.id}
+                    className="appRecentItem"
+                    onClick={() => void openRecentProject(entry)}
+                  >
+                    <span className="appRecentFileType">DSTR</span>
+                    <span>
+                      <strong>{entry.name}</strong>
+                      <small>
+                        {new Date(entry.openedAt).toLocaleString()} ·{" "}
+                        {Math.max(1, Math.round(entry.size / 1024))} KB
+                      </small>
+                    </span>
+                    <i>Open</i>
+                  </button>
+                ))
+              ) : (
+                <p className="appRecentEmpty">Projects you open will appear here.</p>
+              )}
+            </div>
+          </article>
+
+          <article className="appRecentPanel">
+            <div className="appRecentHeader">
+              <div>
+                <small>RECENTLY OPENED</small>
+                <h2>Audio</h2>
+              </div>
+            </div>
+            <div className="appRecentList">
+              {recentAudio.length ? (
+                recentAudio.map((entry) => (
+                  <button
+                    key={entry.id}
+                    className="appRecentItem"
+                    onClick={() => void openRecentAudioFile(entry)}
+                  >
+                    <span className="appRecentFileType audio">MP3</span>
+                    <span>
+                      <strong>{entry.name}</strong>
+                      <small>
+                        {new Date(entry.openedAt).toLocaleString()} ·{" "}
+                        {(entry.size / (1024 * 1024)).toFixed(1)} MB
+                      </small>
+                    </span>
+                    <i>Load</i>
+                  </button>
+                ))
+              ) : (
+                <p className="appRecentEmpty">MP3 files you load will appear here.</p>
+              )}
+            </div>
+          </article>
         </section>
 
         <section className="appInfoGrid">
@@ -1636,14 +1959,15 @@ function clearFixture(fixture: PatchedFixture) {
             <div className="appInfoCardHeader">
               <div>
                 <small>SUPPORTED DEVICES</small>
-                <h2>USB DMX + serial</h2>
+                <h2>USB DMX + Art-Net</h2>
               </div>
             </div>
             <ul className="appInfoList">
               <li>FTDI-based USB-DMX interfaces</li>
               <li>Generic USB serial DMX devices exposed as COM or tty ports</li>
+              <li>Art-Net nodes discovered automatically over UDP</li>
               <li>Live DMX universe output with 512 channels</li>
-              <li>Auto-detect + auto-connect to preferred USB DMX hardware</li>
+              <li>USB DMX is preferred automatically when both transports are available</li>
             </ul>
             <div className="appInfoMetaList compact">
               <div>
@@ -1655,8 +1979,16 @@ function clearFixture(fixture: PatchedFixture) {
                 <strong>{liveOutput ? "Enabled" : "Disabled"}</strong>
               </div>
               <div>
-                <span>Selected port</span>
-                <strong>{selectedPort || "None"}</strong>
+                <span>Selected output</span>
+                <strong>
+                  {selectedOutputIds.length
+                    ? `${selectedOutputIds.length} output${selectedOutputIds.length === 1 ? "" : "s"}${
+                        selectedOutputIds.some((id) => id.startsWith("artnet:"))
+                          ? ` · Universe ${artNetUniverse}`
+                          : ""
+                      }`
+                    : "None"}
+                </strong>
               </div>
             </div>
           </article>
@@ -1681,28 +2013,105 @@ function clearFixture(fixture: PatchedFixture) {
       ) : page === "patch" ? (
       <main className="container">
       <h1>DMX Timeline</h1>
-      <p className="subtitle">First milestone: USB-DMX output tester</p>
+      <p className="subtitle">USB DMX and Art-Net output</p>
 
       <section className="card">
-        <h2>USB-DMX Device</h2>
+        <h2>DMX Output Device</h2>
 
         <div className="row">
           <button onClick={refreshPorts}>Refresh Ports</button>
 
-          <select
-            value={selectedPort}
-            onChange={(e) => setSelectedPort(e.target.value)}
-            disabled={connected}
-          >
+          <label className={`artNetEnableToggle ${artNetEnabled ? "enabled" : ""}`}>
+            <input
+              type="checkbox"
+              checked={artNetEnabled}
+              onChange={(event) =>
+                void setArtNetOutputEnabled(event.target.checked)
+              }
+            />
+            <span>
+              <strong>Art-Net</strong>
+              <small>{artNetEnabled ? "Discovery on" : "Off"}</small>
+            </span>
+          </label>
+
+          <div className="dmxOutputChecklist">
+            {!ports.length && !artNetNodes.length ? (
+              <span className="dmxOutputEmpty">No DMX devices found</span>
+            ) : null}
             {ports.map((port) => (
-              <option key={port.portName} value={port.portName}>
-                {getPortLabel(port)}
-              </option>
+              <label key={port.portName}>
+                <input
+                  type="checkbox"
+                  checked={selectedOutputIds.includes(port.portName)}
+                  disabled={connected}
+                  onChange={(event) => {
+                    const next = event.target.checked
+                      ? [
+                          port.portName,
+                          ...selectedOutputIds.filter(
+                            (id) =>
+                              id.startsWith("artnet:") || id === port.portName,
+                          ),
+                        ]
+                      : selectedOutputIds.filter((id) => id !== port.portName);
+                    selectedOutputIdsRef.current = next;
+                    setSelectedOutputIds(next);
+                    setSelectedPort(next[0] ?? "");
+                  }}
+                />
+                <span>
+                  <strong>{getPortLabel(port)}</strong>
+                  <small>USB DMX · Preferred</small>
+                </span>
+              </label>
             ))}
-          </select>
+            {artNetEnabled ? artNetNodes.map((node) => {
+              const deviceId = getArtNetDeviceId(node);
+              return (
+                <label key={deviceId}>
+                  <input
+                    type="checkbox"
+                    checked={selectedOutputIds.includes(deviceId)}
+                    disabled={connected}
+                    onChange={(event) => {
+                      const next = event.target.checked
+                        ? [...selectedOutputIds, deviceId]
+                        : selectedOutputIds.filter((id) => id !== deviceId);
+                      selectedOutputIdsRef.current = next;
+                      setSelectedOutputIds(next);
+                      setSelectedPort(next[0] ?? "");
+                    }}
+                  />
+                  <span>
+                    <strong>{getArtNetNodeLabel(node)}</strong>
+                    <small>Art-Net</small>
+                  </span>
+                </label>
+              );
+            }) : null}
+          </div>
+
+          {selectedOutputIds.some((id) => id.startsWith("artnet:")) ? (
+            <label className="artNetUniverseControl">
+              Universe
+              <input
+                type="number"
+                min="0"
+                max="32767"
+                value={artNetUniverse}
+                disabled={connected}
+                onChange={(event) =>
+                  setArtNetUniverse(
+                    Math.min(32767, Math.max(0, Number(event.target.value))),
+                  )
+                }
+              />
+            </label>
+          ) : null}
 
           {!connected ? (
-            <button onClick={connect} disabled={!selectedPort}>
+            <button onClick={connect} disabled={!selectedOutputIds.length}>
               Connect
             </button>
           ) : (
@@ -2058,7 +2467,11 @@ function clearFixture(fixture: PatchedFixture) {
       </section>
 
       <section className="card">
-        <UniverseGrid fixtures={fixtures} activeFixtureId={activeFixtureId} />
+        <UniverseGrid
+          fixtures={fixtures}
+          activeFixtureId={activeFixtureId}
+          channels={channels}
+        />
       </section>
 
       </main>
@@ -2071,7 +2484,10 @@ function clearFixture(fixture: PatchedFixture) {
           onDocumentStateChange={updateActiveStageTimeline}
           onAudioSourceChange={updateActiveStageAudioSource}
           initialAudioSourceUrl={stageAudioSources[activeStage?.id ?? "stage-1"]?.url ?? null}
+          requestedAudioFile={requestedAudioFile}
+          onRequestedAudioHandled={() => setRequestedAudioFile(null)}
           initialDocumentState={activeStage?.timeline ?? null}
+          stagePlacements={activeStage?.plot2d ?? []}
           stages={stages.map((stage) => ({ id: stage.id, name: stage.name }))}
           activeStageId={activeStage?.id ?? "stage-1"}
           onSelectStage={setActiveStageId}
@@ -2106,9 +2522,11 @@ function clearFixture(fixture: PatchedFixture) {
 function UniverseGrid({
   fixtures,
   activeFixtureId,
+  channels,
 }: {
   fixtures: PatchedFixture[];
   activeFixtureId: string;
+  channels: number[];
 }) {
   const palette = ["#3185ff", "#e348b8", "#f2a93b", "#55ba74", "#8b6ee8"];
   const [hoveredChannel, setHoveredChannel] = useState<{
@@ -2116,6 +2534,8 @@ function UniverseGrid({
     fixtureName: string;
     modeName: string;
     range: string;
+    channelLabel: string;
+    value: number;
   } | null>(null);
   return (
     <div className="universePanel">
@@ -2125,14 +2545,17 @@ function UniverseGrid({
           <span>512 channel patch overview</span>
         </div>
         <div className="universeMeta">
-          {hoveredChannel ? (
-            <div className="universeHoverCard">
-              <strong>{hoveredChannel.fixtureName}</strong>
-              <span>
-                DMX {hoveredChannel.address} · {hoveredChannel.range} · {hoveredChannel.modeName}
-              </span>
-            </div>
-          ) : null}
+          <div
+            className={`universeHoverCard ${hoveredChannel ? "isVisible" : ""}`}
+            aria-hidden={!hoveredChannel}
+          >
+            <strong>{hoveredChannel?.fixtureName ?? "Channel details"}</strong>
+            <span>
+              {hoveredChannel
+                ? `DMX ${hoveredChannel.address} · ${hoveredChannel.channelLabel} · Value ${hoveredChannel.value} · ${hoveredChannel.range} · ${hoveredChannel.modeName}`
+                : "Hover over a patched channel"}
+            </span>
+          </div>
           <span>{fixtures.reduce((total, fixture) => total + getModeChannelCount(getFixtureMode(fixture.modeId)), 0)} channels used</span>
         </div>
       </div>
@@ -2144,12 +2567,22 @@ function UniverseGrid({
           );
           const fixture = fixtures[fixtureIndex];
           const mode = fixture ? getFixtureMode(fixture.modeId) : null;
+          const fixtureChannel = fixture && mode
+            ? mode.channels.find(
+                (channel) => fixture.startAddress + channel.offset === address,
+              )
+            : null;
+          const liveValue = channels[index] ?? 0;
           return (
             <button
               key={address}
               className={`${fixture ? "occupiedChannel" : ""} ${fixture?.id === activeFixtureId ? "activeChannel" : ""}`}
               style={fixture ? { "--fixture-color": palette[fixtureIndex % palette.length] } as CSSProperties : undefined}
-              title={fixture ? `${address}: ${fixture.name}` : `DMX ${address}: Unpatched`}
+              title={
+                fixture
+                  ? `DMX ${address}: ${fixture.name} · ${fixtureChannel?.label ?? "Channel"} · Value ${liveValue}`
+                  : `DMX ${address}: Unpatched · Value ${liveValue}`
+              }
               onMouseEnter={() =>
                 setHoveredChannel(
                   fixture
@@ -2158,13 +2591,16 @@ function UniverseGrid({
                         fixtureName: fixture.name,
                         modeName: mode?.name ?? "",
                         range: `${fixture.startAddress}-${getFixtureEndAddress(fixture)}`,
+                        channelLabel: fixtureChannel?.label ?? "Channel",
+                        value: liveValue,
                       }
                     : null,
                 )
               }
               onMouseLeave={() => setHoveredChannel(null)}
             >
-              {address}
+              <strong className="channelValue">{liveValue}</strong>
+              <span className="channelAddress">{address}</span>
             </button>
           );
         })}
@@ -2207,11 +2643,26 @@ function getStagePreviewOutput(
       before && after
         ? before.value + (after.value - before.value) * Math.min(1, Math.max(0, progress))
         : 0;
-    const color =
+    const activeTransition =
+      [...(data.colorTransitions ?? [])]
+        .reverse()
+        .find(
+          (transition) =>
+            playhead >= transition.start &&
+            playhead < transition.start + transition.duration,
+        ) ?? null;
+    const solidColor =
       [...data.colors]
         .reverse()
         .find((clip) => playhead >= clip.start && playhead < clip.start + clip.duration)?.color ??
       null;
+    const color = activeTransition
+      ? interpolateHexColor(
+          activeTransition.fromColor,
+          activeTransition.toColor,
+          (playhead - activeTransition.start) / Math.max(0.001, activeTransition.duration),
+        )
+      : solidColor;
     const strobe =
       [...data.strobes]
         .reverse()
@@ -2293,6 +2744,7 @@ function StageView({
     startY: number;
     originX: number;
     originY: number;
+    moved: boolean;
   } | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const loadedStageAudioRef = useRef<string | null>(null);
@@ -2728,6 +3180,7 @@ function StageView({
                 startY: event.clientY,
                 originX: plotViewportOffset.x,
                 originY: plotViewportOffset.y,
+                moved: false,
               };
               event.currentTarget.setPointerCapture(event.pointerId);
             }}
@@ -2736,14 +3189,41 @@ function StageView({
               if (!pan || pan.pointerId !== event.pointerId || !event.currentTarget.hasPointerCapture(event.pointerId)) {
                 return;
               }
+              const deltaX = event.clientX - pan.startX;
+              const deltaY = event.clientY - pan.startY;
+              if (Math.hypot(deltaX, deltaY) > 4) {
+                pan.moved = true;
+              }
               setPlotViewportOffset(
                 clampPlotViewportOffset(
-                  pan.originX + (event.clientX - pan.startX),
-                  pan.originY + (event.clientY - pan.startY),
+                  pan.originX + deltaX,
+                  pan.originY + deltaY,
                 ),
               );
             }}
             onPointerUp={(event) => {
+              const pan = plotPanRef.current;
+              if (
+                pan &&
+                pan.pointerId === event.pointerId &&
+                !pan.moved &&
+                selectedFixtureForPlot
+              ) {
+                const bounds = stageFrameRef.current?.getBoundingClientRect();
+                if (
+                  bounds &&
+                  event.clientX >= bounds.left &&
+                  event.clientX <= bounds.right &&
+                  event.clientY >= bounds.top &&
+                  event.clientY <= bounds.bottom
+                ) {
+                  placeFixtureAtClientPosition(
+                    selectedFixtureForPlot,
+                    event.clientX,
+                    event.clientY,
+                  );
+                }
+              }
               if (event.currentTarget.hasPointerCapture(event.pointerId)) {
                 event.currentTarget.releasePointerCapture(event.pointerId);
               }
@@ -2760,17 +3240,6 @@ function StageView({
               className="danceStageGrid"
               style={{
                 transform: `translate(calc(-50% + ${plotViewportOffset.x}px), calc(-50% + ${plotViewportOffset.y}px)) scale(${plotZoom})`,
-              }}
-              onClick={(event) => {
-                if (!selectedFixtureForPlot) return;
-                if (event.target !== event.currentTarget && !(event.target as HTMLElement).classList.contains("danceStageFrame")) {
-                  return;
-                }
-                placeFixtureAtClientPosition(
-                  selectedFixtureForPlot,
-                  event.clientX,
-                  event.clientY,
-                );
               }}
             >
               <div
@@ -2908,6 +3377,17 @@ function StageView({
                         left: `${(clip.start / duration) * 100}%`,
                         width: `${(clip.duration / duration) * 100}%`,
                         background: clip.color,
+                      }}
+                    />
+                  ))}
+                  {data?.colorTransitions?.map((transition) => (
+                    <i
+                      key={transition.id}
+                      className="miniColorClip miniColorTransition"
+                      style={{
+                        left: `${(transition.start / duration) * 100}%`,
+                        width: `${(transition.duration / duration) * 100}%`,
+                        background: `linear-gradient(90deg, ${transition.fromColor}, ${transition.toColor})`,
                       }}
                     />
                   ))}

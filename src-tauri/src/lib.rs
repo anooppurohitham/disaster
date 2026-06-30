@@ -1,20 +1,23 @@
 use serde::Serialize;
 use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
 use std::io::{ErrorKind, Write};
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::thread;
 use std::time::Duration;
-use tauri::{Manager, State};
 #[cfg(desktop)]
 use tauri::AppHandle;
+use tauri::{Manager, State};
 #[cfg(desktop)]
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 const LIVE_OUTPUT_INTERVAL_MS: u64 = 40;
 const OUTPUT_CHANNEL_COUNT: usize = 512;
+const ARTNET_PORT: u16 = 6454;
+const ARTNET_PROTOCOL_VERSION: u16 = 14;
 
 struct DmxState {
     inner: Arc<Mutex<DmxInner>>,
@@ -26,7 +29,15 @@ struct PendingUpdateState(Mutex<Option<Update>>);
 
 struct DmxInner {
     port: Option<Box<dyn SerialPort>>,
+    artnet: Vec<ArtNetOutput>,
     latest_channels: Vec<u8>,
+}
+
+struct ArtNetOutput {
+    socket: UdpSocket,
+    target: SocketAddrV4,
+    universe: u16,
+    sequence: u8,
 }
 
 #[derive(Serialize)]
@@ -34,6 +45,14 @@ struct DmxInner {
 struct SerialPortDto {
     port_name: String,
     port_type: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtNetNodeDto {
+    ip_address: String,
+    short_name: String,
+    long_name: String,
 }
 
 #[cfg(desktop)]
@@ -57,6 +76,63 @@ fn list_serial_ports() -> Result<Vec<SerialPortDto>, String> {
             port_type: format!("{:?}", p.port_type),
         })
         .collect())
+}
+
+#[tauri::command]
+fn discover_artnet_nodes() -> Result<Vec<ArtNetNodeDto>, String> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|e| e.to_string())?;
+    socket.set_broadcast(true).map_err(|e| e.to_string())?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(180)))
+        .map_err(|e| e.to_string())?;
+
+    let mut poll = [0u8; 14];
+    poll[..8].copy_from_slice(b"Art-Net\0");
+    poll[8..10].copy_from_slice(&0x2000u16.to_le_bytes());
+    poll[10..12].copy_from_slice(&ARTNET_PROTOCOL_VERSION.to_be_bytes());
+    socket
+        .send_to(&poll, SocketAddrV4::new(Ipv4Addr::BROADCAST, ARTNET_PORT))
+        .map_err(|e| e.to_string())?;
+
+    let mut nodes = Vec::<ArtNetNodeDto>::new();
+    let mut buffer = [0u8; 1024];
+    loop {
+        match socket.recv_from(&mut buffer) {
+            Ok((length, source)) => {
+                if length < 108
+                    || &buffer[..8] != b"Art-Net\0"
+                    || u16::from_le_bytes([buffer[8], buffer[9]]) != 0x2100
+                {
+                    continue;
+                }
+                let ip_address = source.ip().to_string();
+                if nodes.iter().any(|node| node.ip_address == ip_address) {
+                    continue;
+                }
+                nodes.push(ArtNetNodeDto {
+                    ip_address,
+                    short_name: read_artnet_string(&buffer[26..44]),
+                    long_name: read_artnet_string(&buffer[44..108]),
+                });
+            }
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    nodes.sort_by(|a, b| a.ip_address.cmp(&b.ip_address));
+    Ok(nodes)
+}
+
+fn read_artnet_string(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).trim().to_string()
 }
 
 #[tauri::command]
@@ -93,6 +169,42 @@ fn connect_dmx(port_name: String, state: State<'_, DmxState>) -> Result<(), Stri
 }
 
 #[tauri::command]
+fn connect_artnet(
+    ip_address: String,
+    universe: u16,
+    state: State<'_, DmxState>,
+) -> Result<(), String> {
+    let ip = ip_address
+        .parse::<Ipv4Addr>()
+        .map_err(|_| format!("Invalid Art-Net IPv4 address: {ip_address}"))?;
+    if universe > 32767 {
+        return Err("Art-Net universe must be between 0 and 32767".to_string());
+    }
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|e| e.to_string())?;
+    let mut guard = state
+        .inner
+        .lock()
+        .map_err(|_| "Failed to lock DMX state".to_string())?;
+    if let Some(existing) = guard
+        .artnet
+        .iter_mut()
+        .find(|output| output.target.ip() == &ip)
+    {
+        existing.universe = universe;
+        existing.sequence = 1;
+        return Ok(());
+    }
+    guard.artnet.push(ArtNetOutput {
+        socket,
+        target: SocketAddrV4::new(ip, ARTNET_PORT),
+        universe,
+        sequence: 1,
+    });
+    state.live_enabled.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
 fn disconnect_dmx(state: State<'_, DmxState>) -> Result<(), String> {
     state.live_enabled.store(false, Ordering::SeqCst);
 
@@ -102,6 +214,7 @@ fn disconnect_dmx(state: State<'_, DmxState>) -> Result<(), String> {
         .map_err(|_| "Failed to lock DMX state".to_string())?;
 
     guard.port = None;
+    guard.artnet.clear();
 
     Ok(())
 }
@@ -128,12 +241,7 @@ fn send_dmx(channels: Vec<u8>, state: State<'_, DmxState>) -> Result<(), String>
         return Ok(());
     }
 
-    let port = guard
-        .port
-        .as_mut()
-        .ok_or_else(|| "No DMX device connected".to_string())?;
-
-    write_raw_dmx_frame(port, &normalized)?;
+    write_dmx_output(&mut guard, &normalized)?;
 
     Ok(())
 }
@@ -153,12 +261,7 @@ fn blackout(state: State<'_, DmxState>) -> Result<(), String> {
         return Ok(());
     }
 
-    let port = guard
-        .port
-        .as_mut()
-        .ok_or_else(|| "No DMX device connected".to_string())?;
-
-    write_raw_dmx_frame(port, &normalized)?;
+    write_dmx_output(&mut guard, &normalized)?;
 
     Ok(())
 }
@@ -246,6 +349,60 @@ fn write_raw_dmx_frame(port: &mut Box<dyn SerialPort>, channels: &[u8]) -> Resul
     Ok(())
 }
 
+fn build_artnet_dmx_packet(channels: &[u8], universe: u16, sequence: u8) -> Vec<u8> {
+    let length = channels.len().min(OUTPUT_CHANNEL_COUNT);
+    let mut packet = Vec::with_capacity(18 + length);
+    packet.extend_from_slice(b"Art-Net\0");
+    packet.extend_from_slice(&0x5000u16.to_le_bytes());
+    packet.extend_from_slice(&ARTNET_PROTOCOL_VERSION.to_be_bytes());
+    packet.push(sequence);
+    packet.push(0);
+    packet.push((universe & 0xff) as u8);
+    packet.push(((universe >> 8) & 0x7f) as u8);
+    packet.extend_from_slice(&(length as u16).to_be_bytes());
+    packet.extend_from_slice(&channels[..length]);
+    packet
+}
+
+fn write_artnet_frame(output: &mut ArtNetOutput, channels: &[u8]) -> Result<(), String> {
+    let packet = build_artnet_dmx_packet(channels, output.universe, output.sequence);
+    output
+        .socket
+        .send_to(&packet, output.target)
+        .map_err(|e| e.to_string())?;
+    output.sequence = if output.sequence == u8::MAX {
+        1
+    } else {
+        output.sequence + 1
+    };
+    Ok(())
+}
+
+fn write_dmx_output(inner: &mut DmxInner, channels: &[u8]) -> Result<(), String> {
+    let mut wrote_output = false;
+    let mut errors = Vec::new();
+    if let Some(port) = inner.port.as_mut() {
+        wrote_output = true;
+        if let Err(error) = write_raw_dmx_frame(port, channels) {
+            errors.push(format!("USB DMX: {error}"));
+        }
+    }
+    for output in &mut inner.artnet {
+        wrote_output = true;
+        if let Err(error) = write_artnet_frame(output, channels) {
+            errors.push(format!("Art-Net {}: {error}", output.target.ip()));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    if wrote_output {
+        Ok(())
+    } else {
+        Err("No DMX device connected".to_string())
+    }
+}
+
 fn write_bytes_with_retry(port: &mut Box<dyn SerialPort>, data: &[u8]) -> Result<(), String> {
     let mut written = 0;
     let mut retries = 0;
@@ -313,10 +470,7 @@ fn spawn_live_output_thread(inner: Arc<Mutex<DmxInner>>, live_enabled: Arc<Atomi
 
             let channels = guard.latest_channels.clone();
 
-            match guard.port.as_mut() {
-                Some(port) => write_raw_dmx_frame(port, &channels),
-                None => Ok(()),
-            }
+            write_dmx_output(&mut guard, &channels)
         };
 
         if let Err(e) = result {
@@ -332,6 +486,7 @@ pub fn run() {
     let dmx_state = DmxState {
         inner: Arc::new(Mutex::new(DmxInner {
             port: None,
+            artnet: Vec::new(),
             latest_channels: vec![0; OUTPUT_CHANNEL_COUNT],
         })),
         live_enabled: Arc::new(AtomicBool::new(false)),
@@ -358,7 +513,9 @@ pub fn run() {
         .manage(dmx_state)
         .invoke_handler(tauri::generate_handler![
             list_serial_ports,
+            discover_artnet_nodes,
             connect_dmx,
+            connect_artnet,
             disconnect_dmx,
             set_live_output,
             send_dmx,
@@ -370,4 +527,23 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_artnet_dmx_packet_with_correct_header_and_universe() {
+        let channels = vec![1, 2, 3, 4];
+        let packet = build_artnet_dmx_packet(&channels, 0x0123, 7);
+        assert_eq!(&packet[..8], b"Art-Net\0");
+        assert_eq!(&packet[8..10], &[0x00, 0x50]);
+        assert_eq!(&packet[10..12], &[0x00, 0x0e]);
+        assert_eq!(packet[12], 7);
+        assert_eq!(packet[14], 0x23);
+        assert_eq!(packet[15], 0x01);
+        assert_eq!(&packet[16..18], &[0x00, 0x04]);
+        assert_eq!(&packet[18..], channels);
+    }
 }
