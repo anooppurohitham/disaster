@@ -11,11 +11,14 @@ const version = args.get("--version");
 const releaseBaseUrl = args.get("--release-base-url");
 const outFile = args.get("--out");
 const defaultArch = (args.get("--default-arch") || process.env.RUNNER_ARCH || "x64").toLowerCase();
-const notes = args.get("--notes") || undefined;
+const notesFile = args.get("--notes-file");
+const notes =
+  args.get("--notes") ||
+  (notesFile ? fs.readFileSync(notesFile, "utf8").trim() : undefined);
 
 if (!bundleDir || !version || !releaseBaseUrl || !outFile) {
   console.error(
-    "Usage: node scripts/build-updater-manifest.mjs --bundle-dir <dir> --version <version> --release-base-url <url> --out <file> [--default-arch <arch>] [--notes <text>]",
+    "Usage: node scripts/build-updater-manifest.mjs --bundle-dir <dir> --version <version> --release-base-url <url> --out <file> [--default-arch <arch>] [--notes <text> | --notes-file <path>]",
   );
   process.exit(1);
 }

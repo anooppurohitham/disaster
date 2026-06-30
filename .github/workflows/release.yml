@@ -82,6 +82,7 @@ jobs:
           --version "$env:RELEASE_VERSION"
           --release-base-url "$env:RELEASE_BASE_URL"
           --default-arch "${{ matrix.runner_arch }}"
+          --notes-file RELEASE_NOTES.md
           --out "release-manifest/${{ matrix.label }}.json"
         shell: powershell
 
@@ -96,6 +97,7 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: Disaster ${{ env.RELEASE_VERSION }}
+          body_path: RELEASE_NOTES.md
           files: |
             src-tauri/target/release/bundle/**/*
 
@@ -118,6 +120,7 @@ jobs:
           node scripts/merge-updater-manifests.mjs
           --input-dir updater-fragments
           --version "${{ needs.prepare.outputs.version }}"
+          --notes-file RELEASE_NOTES.md
           --out dist-pages/updates/latest.json
 
       - uses: actions/upload-pages-artifact@v3

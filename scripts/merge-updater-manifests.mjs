@@ -9,11 +9,14 @@ for (let index = 2; index < process.argv.length; index += 2) {
 const inputDir = args.get("--input-dir");
 const version = args.get("--version");
 const outFile = args.get("--out");
-const notes = args.get("--notes") || undefined;
+const notesFile = args.get("--notes-file");
+const notes =
+  args.get("--notes") ||
+  (notesFile ? fs.readFileSync(notesFile, "utf8").trim() : undefined);
 
 if (!inputDir || !version || !outFile) {
   console.error(
-    "Usage: node scripts/merge-updater-manifests.mjs --input-dir <dir> --version <version> --out <file> [--notes <text>]",
+    "Usage: node scripts/merge-updater-manifests.mjs --input-dir <dir> --version <version> --out <file> [--notes <text> | --notes-file <path>]",
   );
   process.exit(1);
 }

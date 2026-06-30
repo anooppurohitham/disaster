@@ -11,6 +11,7 @@ import TimelineEditor, {
 } from "./TimelineEditor";
 import disasterLogo from "./assets/disaster-logo.png";
 import packageInfo from "../package.json";
+import currentReleaseNotes from "../RELEASE_NOTES.md?raw";
 
 type SerialPortDto = {
   portName: string;
@@ -217,13 +218,7 @@ const RECENT_PROJECTS_STORAGE_KEY = "disaster.recentProjects.v1";
 const RECENT_AUDIO_STORAGE_KEY = "disaster.recentAudio.v1";
 const FONT_FAMILY_STORAGE_KEY = "disaster.fontFamily.v1";
 const VISUAL_EFFECTS_STORAGE_KEY = "disaster.visualEffects.v1";
-const RECENT_UPDATE_CHANGES = [
-  "Native Open, Save, and Save As support on macOS",
-  "Command-key shortcuts and smoother timeline scrolling on Mac",
-  "Stage orientation labels and unobstructed fixture rotation controls",
-  "Improved intensity waypoint and horizontal-section editing",
-  "Appearance controls for fonts, glows, and gradients",
-];
+const WORKING_VERSION_SUFFIX = "";
 const RECENT_FILES_DATABASE = "disaster-recent-files";
 const RECENT_FILES_STORE = "files";
 const MAX_RECENT_FILES = 6;
@@ -385,11 +380,18 @@ function updateChangeList(body?: string | null) {
         .replace(/^\d+[.)]\s+/, "")
         .replace(/^#+\s*/, ""),
     )
-    .filter((line) => line.length > 0 && line.toLowerCase() !== "changes");
-  return changes.length ? changes.slice(0, 6) : RECENT_UPDATE_CHANGES;
+    .filter(
+      (line) =>
+        line.length > 0 &&
+        line.toLowerCase() !== "changes" &&
+        line.toLowerCase() !== "recent changes",
+    );
+  if (changes.length) return changes.slice(0, 7);
+  return updateChangeList(currentReleaseNotes);
 }
 
 function App() {
+  const displayVersion = `${packageInfo.version}${WORKING_VERSION_SUFFIX}`;
   const [page, setPage] = useState<"app" | "patch" | "timeline" | "stage">("app");
   const [fontFamily, setFontFamily] = useState(
     () => localStorage.getItem(FONT_FAMILY_STORAGE_KEY) ?? "system",
@@ -1931,7 +1933,7 @@ function clearFixture(fixture: PatchedFixture) {
           </div>
           <div className="appInfoHeroVersion">
             <small>Current version</small>
-            <strong>{packageInfo.version}</strong>
+            <strong>{displayVersion}</strong>
           </div>
         </section>
 
@@ -2085,7 +2087,7 @@ function clearFixture(fixture: PatchedFixture) {
                 <span>
                   {availableUpdate
                     ? `Version ${availableUpdate.version}`
-                    : `Version ${packageInfo.version}`}
+                    : `Version ${displayVersion}`}
                 </span>
               </div>
               <ul>

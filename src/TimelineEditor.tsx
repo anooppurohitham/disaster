@@ -2361,6 +2361,35 @@ export default function TimelineEditor({
             onScroll={handleViewportScroll}
             onWheelCapture={handleTimelineWheel}
             onPointerDownCapture={(event) => {
+              const target = event.target as HTMLElement;
+              const primaryModifier = event.ctrlKey || event.metaKey;
+              const isGraphOrControl = Boolean(
+                target.closest(
+                  "button, input, select, textarea, .colorBlock, .strobeClip, .effectRegion, .waypoint, .intensityPath, .curveBackdrop, .clipDragSurface, .resizeHandle",
+                ),
+              );
+              if (
+                primaryModifier &&
+                event.button === 0 &&
+                !selectionMode &&
+                !isGraphOrControl
+              ) {
+                selectionGestureRef.current = true;
+                event.currentTarget.dataset.selectionStartX = String(event.clientX);
+                event.currentTarget.dataset.selectionStartY = String(event.clientY);
+                event.currentTarget.setPointerCapture(event.pointerId);
+                setSelections(
+                  getSelectionsFromMarquee(
+                    event.clientX,
+                    event.clientY,
+                    event.clientX,
+                    event.clientY,
+                  ),
+                );
+                event.preventDefault();
+                event.stopPropagation();
+                return;
+              }
               if (
                 selectionGestureRef.current ||
                 !selections.length ||
@@ -2386,6 +2415,49 @@ export default function TimelineEditor({
 
               if (!clickedSelection) {
                 setSelections([]);
+              }
+            }}
+            onPointerMoveCapture={(event) => {
+              if (
+                !selectionGestureRef.current ||
+                !event.currentTarget.hasPointerCapture(event.pointerId)
+              ) {
+                return;
+              }
+              setSelections(
+                getSelectionsFromMarquee(
+                  Number(
+                    event.currentTarget.dataset.selectionStartX ??
+                      event.clientX,
+                  ),
+                  Number(
+                    event.currentTarget.dataset.selectionStartY ??
+                      event.clientY,
+                  ),
+                  event.clientX,
+                  event.clientY,
+                ),
+              );
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            onPointerUpCapture={(event) => {
+              if (
+                !selectionGestureRef.current ||
+                !event.currentTarget.hasPointerCapture(event.pointerId)
+              ) {
+                return;
+              }
+              selectionGestureRef.current = false;
+              event.currentTarget.releasePointerCapture(event.pointerId);
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            onPointerCancelCapture={(event) => {
+              if (!selectionGestureRef.current) return;
+              selectionGestureRef.current = false;
+              if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                event.currentTarget.releasePointerCapture(event.pointerId);
               }
             }}
             onWheel={handleTimelineWheel}
@@ -3606,6 +3678,13 @@ function ColorLane({ fixtureId, clips, transitions, zoom, grid, duration, width,
         zoom={zoom}
         grid={grid}
         duration={duration}
+        minimumStart={transitions
+          .filter((transition) => transition.rightClipId === clip.id)
+          .reduce(
+            (minimum, transition) =>
+              Math.max(minimum, transition.start + transition.duration),
+            0,
+          )}
         commit={commit}
         onPreviewColorChange={onPreviewColorChange}
         fixtureId={fixtureId}
@@ -3671,6 +3750,7 @@ const ColorClipBlock = memo(function ColorClipBlock({
   zoom,
   grid,
   duration,
+  minimumStart,
   commit,
   onPreviewColorChange,
   fixtureId,
@@ -3684,6 +3764,7 @@ const ColorClipBlock = memo(function ColorClipBlock({
   zoom: number;
   grid: number;
   duration: number;
+  minimumStart: number;
   commit: (clips: ColorClip[]) => void;
   onPreviewColorChange: (color: string | null) => void;
   fixtureId: string;
@@ -3780,7 +3861,10 @@ const ColorClipBlock = memo(function ColorClipBlock({
             item.id === clip.id
               ? {
                   ...item,
-                  start: Math.min(duration - item.duration, Math.max(0, nextStart)),
+                  start: Math.max(
+                    minimumStart,
+                    Math.min(duration - item.duration, nextStart),
+                  ),
                 }
               : item,
           ));
