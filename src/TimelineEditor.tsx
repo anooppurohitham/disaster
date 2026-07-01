@@ -462,10 +462,10 @@ function parseCueCommand(
   const clearStrobe = /\b(steady|strobe off|stop strobing|no strobe)\b/.test(normalized);
   const wantsPulse = /\b(pulse|pulsing|pulsate|pulsating|flash|flashing|blink|blinking)\b/.test(normalized);
   const referencesAudio =
-    /\b(audio|mp3|song|music|waveform|beeps?|drum(?:\s+beats?)?|loud parts?|high points?)\b/.test(normalized);
+    /\b(audio|mp3|song|music|waveform|beeps?|drum(?:\s+beats?)?|kicks?|thumps?|percussion|bass hits?|loud parts?|high points?)\b/.test(normalized);
   const wantsAudioPeaks =
     referencesAudio &&
-    /\b(beeps?|drum(?:\s+beats?)?|loud parts?|high points?|peaks?)\b/.test(normalized) &&
+    /\b(beeps?|drum(?:\s+beats?)?|kicks?|thumps?|percussion|bass hits?|loud parts?|high points?|peaks?)\b/.test(normalized) &&
     /\b(pulse|flash|blink|match|follow|react)\b/.test(normalized);
   const wantsAudioEnvelope =
     referencesAudio &&
@@ -932,17 +932,32 @@ function buildAudioReactivePoints(
 
   if (mode === "peaks") {
     const sorted = [...region].sort((left, right) => left - right);
-    const threshold = sorted[Math.floor(sorted.length * 0.78)] ?? 0.7;
-    const minimumGap = 0.16;
-    const attackLead = 0.035;
+    const transientThreshold = sorted[Math.floor(sorted.length * 0.68)] ?? 0.55;
+    const strongThreshold = sorted[Math.floor(sorted.length * 0.84)] ?? 0.75;
+    const minimumGap = 0.11;
+    const attackLead = 0.025;
     const points: Point[] = [{ time: start, value: 0 }];
     let lastPeakTime = start - minimumGap;
-    for (let index = 1; index < region.length - 1; index += 1) {
+    for (let index = 2; index < region.length - 2; index += 1) {
       const value = region[index];
-      if (value < threshold || value < region[index - 1] || value <= region[index + 1]) continue;
+      const baselineStart = Math.max(0, index - 6);
+      const baselineRegion = region.slice(baselineStart, index);
+      const baseline =
+        baselineRegion.reduce((sum, sample) => sum + sample, 0) /
+        Math.max(1, baselineRegion.length);
+      const isLocalPeak =
+        value >= region[index - 2] &&
+        value >= region[index - 1] &&
+        value >= region[index + 1] &&
+        value >= region[index + 2];
+      const isStrongHit = value >= strongThreshold;
+      const isTransientHit =
+        value >= transientThreshold &&
+        value - baseline >= Math.max(0.025, value * 0.075);
+      if (!isLocalPeak || (!isStrongHit && !isTransientHit)) continue;
       const time = Math.max(start, sampleTime(index) - attackLead);
       if (time - lastPeakTime < minimumGap) continue;
-      const shoulder = Math.min(0.06, minimumGap / 3);
+      const shoulder = Math.min(0.05, minimumGap / 3);
       points.push(
         { time: Math.max(start, time - shoulder), value: 0 },
         { time, value: maximumIntensity },
@@ -3364,6 +3379,13 @@ export default function TimelineEditor({
             scroll={scrollPosition}
             duration={duration}
             playhead={playhead}
+            onSeek={(time) => {
+              const next = Math.min(duration, Math.max(0, time));
+              setPlayhead(next);
+              if (audioRef.current?.src) {
+                audioRef.current.currentTime = next;
+              }
+            }}
           />
         </section>
       </div>
@@ -3413,7 +3435,7 @@ export default function TimelineEditor({
               setDuplicateSelectionDialog({
                 source,
                 targetFixtureId: source.fixtureId,
-                targetTime: playhead,
+                targetTime: Math.min(source.start, source.end),
               });
               setContextMenu(null);
             }}
@@ -5423,6 +5445,7 @@ const Waveform = memo(function Waveform({
   scroll,
   duration,
   playhead,
+  onSeek,
 }: {
   samples: number[];
   name: string;
@@ -5431,6 +5454,7 @@ const Waveform = memo(function Waveform({
   scroll: number;
   duration: number;
   playhead: number;
+  onSeek: (time: number) => void;
 }) {
   const renderWidth = Math.max(width, visibleWidth);
   const normalizedScroll = Math.min(
@@ -5479,7 +5503,16 @@ const Waveform = memo(function Waveform({
       <strong>AUDIO</strong>
       <span>{name}</span>
     </div>
-    <div className="waveformWindow">
+    <div
+      className="waveformWindow"
+      onDoubleClick={(event) => {
+        const bounds = event.currentTarget.getBoundingClientRect();
+        const timelineX =
+          event.clientX - bounds.left + normalizedScroll;
+        onSeek((timelineX / Math.max(1, renderWidth)) * duration);
+      }}
+      title="Double-click to move the time marker"
+    >
       <div className="waveformWindowGlow" />
       <div
         className="waveformBars"

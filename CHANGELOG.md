@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.0.16
+
+- Added compact cue previews for minimized fixtures with intensity, color, transition, and strobe information.
+- Added a saved setting for showing or hiding minimized-fixture cue previews.
+- Added Stage View multi-selection movement, undo support, improved marquee accuracy, and click-away deselection.
+- Added fixture renaming while preserving DMX addresses, timeline cues, and Stage View placements.
+- Added range duplication with destination-fixture and start-time controls, plus color creation from empty color lanes.
+- Added confirmed color editing with live DMX preview and smoother color-picker interaction.
+- Improved horizontal zoom, scrolling performance, waveform detail, waveform seeking, and full-timeline fit.
+- Improved cue-assistant spatial row recognition and sensitive kick, thump, percussion, and transient detection.
+- Added scrollable recent-project and recent-audio lists with dark scrollbars.
+- Improved updater release-note generation and restored missing historical changelog entries.
+
+## 0.0.15
+
+- Added persistent Stage View plot zoom and improved spatial row recognition for cue-assistant commands.
+- Added audio-reactive intensity cues for waveform peaks, loud sections, rises, and fades.
+- Improved timeline zoom anchoring, scrolling smoothness, waveform synchronization, and beat-grid density.
+- Added multi-fixture Stage View selection, fixture reordering, and persistent undo history.
+- Improved project save-state tracking and preserved timeline edits while switching views.
+
+## 0.0.14
+
+- Redesigned the timeline waveform with higher-detail audio sampling and a compact audio dock.
+- Added variable pulse and strobe rates with cue-assistant control.
+- Improved intensity waypoint and horizontal/vertical segment dragging.
+- Added spatial cue-assistant targeting for fixture rows and stage positions.
+- Improved fixture-card layout, timeline zoom range, color transitions, and timeline performance.
+
 ## 0.0.13
 
 - Enlarged the DMX universe cells and channel labels for readability.

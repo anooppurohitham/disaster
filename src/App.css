@@ -1476,7 +1476,7 @@ select {
 
 .fixtureListItem {
   display: grid;
-  grid-template-columns: 24px 1fr 130px auto auto;
+  grid-template-columns: 24px 1fr 130px auto auto auto;
   gap: 10px;
   align-items: center;
   padding: 10px;

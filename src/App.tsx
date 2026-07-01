@@ -227,7 +227,7 @@ const FONT_FAMILY_STORAGE_KEY = "disaster.fontFamily.v1";
 const VISUAL_EFFECTS_STORAGE_KEY = "disaster.visualEffects.v1";
 const MINIMIZED_CUE_PREVIEWS_STORAGE_KEY = "disaster.minimizedCuePreviews.v1";
 const STAGE_PLOT_ZOOM_STORAGE_KEY = "disaster.stagePlotZoom.v1";
-const WORKING_VERSION_SUFFIX = "*";
+const WORKING_VERSION_SUFFIX = "";
 const RECENT_FILES_DATABASE = "disaster-recent-files";
 const RECENT_FILES_STORE = "files";
 const MAX_RECENT_FILES = 6;
@@ -1365,6 +1365,34 @@ function deleteFixture(fixtureId: string) {
   setStatus("Fixture removed.");
 }
 
+function renameFixture(fixtureId: string) {
+  const fixture = fixtures.find((item) => item.id === fixtureId);
+  if (!fixture) return;
+  const requestedName = window.prompt("Rename fixture", fixture.name);
+  if (requestedName === null) return;
+  const nextName = requestedName.trim();
+  if (!nextName) {
+    setStatus("Fixture names cannot be empty.");
+    return;
+  }
+  if (
+    fixtures.some(
+      (item) =>
+        item.id !== fixtureId &&
+        item.name.trim().toLowerCase() === nextName.toLowerCase(),
+    )
+  ) {
+    setStatus(`A fixture named "${nextName}" already exists.`);
+    return;
+  }
+  setFixtures((previous) =>
+    previous.map((item) =>
+      item.id === fixtureId ? { ...item, name: nextName } : item,
+    ),
+  );
+  setStatus(`Renamed ${fixture.name} to ${nextName}.`);
+}
+
 function reorderPatchedFixture(
   draggedId: string,
   targetId: string,
@@ -2059,7 +2087,6 @@ function clearFixture(fixture: PatchedFixture) {
           <div className="appInfoHeroBrand">
             <img src={disasterLogo} alt="Disaster logo" />
             <div>
-              <p className="eyebrow">APPLICATION</p>
               <h1>Disaster</h1>
               <span>DMX timeline programming and show playback</span>
             </div>
@@ -2792,6 +2819,15 @@ function clearFixture(fixture: PatchedFixture) {
                 <button
                   onClick={(event) => {
                     event.stopPropagation();
+                    renameFixture(fixture.id);
+                  }}
+                >
+                  Rename
+                </button>
+
+                <button
+                  onClick={(event) => {
+                    event.stopPropagation();
                     deleteFixture(fixture.id);
                   }}
                 >
@@ -3147,6 +3183,8 @@ function StageView({
     startX: number;
     startY: number;
     historyCaptured: boolean;
+    fixtureIds: string[];
+    origins: Record<string, StagePlotFixture>;
   } | null>(null);
   const [plotSelectionBox, setPlotSelectionBox] = useState<{
     left: number;
@@ -3845,18 +3883,32 @@ function StageView({
                         event.preventDefault();
                         event.stopPropagation();
                         setSelectedFixtureForPlot(fixture.id);
-                        setSelectedFixtureIdsForPlot((previous) =>
-                          event.ctrlKey || event.metaKey
-                            ? previous.includes(fixture.id)
+                        const primaryModifier = event.ctrlKey || event.metaKey;
+                        const alreadySelected = selectedFixtureIdsForPlot.includes(fixture.id);
+                        const dragFixtureIds =
+                          !primaryModifier && alreadySelected && selectedFixtureIdsForPlot.length > 1
+                            ? selectedFixtureIdsForPlot
+                            : [fixture.id];
+                        if (primaryModifier) {
+                          setSelectedFixtureIdsForPlot((previous) =>
+                            previous.includes(fixture.id)
                               ? previous.filter((id) => id !== fixture.id)
-                              : [...previous, fixture.id]
-                            : [fixture.id],
-                        );
+                              : [...previous, fixture.id],
+                          );
+                        } else if (!alreadySelected) {
+                          setSelectedFixtureIdsForPlot([fixture.id]);
+                        }
                         fixtureDragRef.current = {
                           pointerId: event.pointerId,
                           startX: event.clientX,
                           startY: event.clientY,
                           historyCaptured: false,
+                          fixtureIds: dragFixtureIds,
+                          origins: Object.fromEntries(
+                            plotFixtures
+                              .filter((item) => dragFixtureIds.includes(item.fixtureId))
+                              .map((item) => [item.fixtureId, { ...item }]),
+                          ),
                         };
                         const target = event.currentTarget;
                         target.setPointerCapture(event.pointerId);
@@ -3877,7 +3929,31 @@ function StageView({
                           drag.historyCaptured = true;
                         }
                         if (!drag?.historyCaptured) return;
-                        placeFixtureAtClientPosition(fixture.id, event.clientX, event.clientY);
+                        const bounds = stageFrameRef.current?.getBoundingClientRect();
+                        if (!bounds) return;
+                        const deltaX = (event.clientX - drag.startX) / bounds.width;
+                        const deltaY = (event.clientY - drag.startY) / bounds.height;
+                        onUpdatePlot2d(
+                          plotFixtures.map((item) => {
+                            const origin = drag.origins[item.fixtureId];
+                            if (!origin) return item;
+                            return {
+                              ...item,
+                              x: snapPlacement(
+                                origin.x + deltaX,
+                                stageGridColumns,
+                                0.04,
+                                0.96,
+                              ),
+                              y: snapPlacement(
+                                origin.y + deltaY,
+                                stageGridRows,
+                                0.08,
+                                0.92,
+                              ),
+                            };
+                          }),
+                        );
                       }}
                       onPointerUp={(event) => {
                         if (event.currentTarget.hasPointerCapture(event.pointerId)) {
