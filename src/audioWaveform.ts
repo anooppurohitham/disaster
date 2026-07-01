@@ -23,7 +23,7 @@ export function createPlaceholderWaveform(sampleCount: number) {
 }
 
 export function getWaveformSampleCount(durationSeconds: number) {
-  return clamp(Math.ceil(durationSeconds * 64), 1600, 12000);
+  return clamp(Math.ceil(durationSeconds * 36), 900, 4800);
 }
 
 export function extractWaveformSamples(buffer: AudioBuffer, sampleCount = 400) {

@@ -69,6 +69,7 @@ export type TrackData = {
   curve: "straight" | "smooth";
 };
 type Selection = { fixtureId: string; start: number; end: number };
+type TrackChangeMode = "preview" | "commit";
 type EffectType = "rise" | "fade" | "pulse" | "spline" | "random";
 type FixtureGroup = { id: string; name: string; fixtureIds: string[] };
 export type BeatgridPoint = { id: string; time: number; bpm: number };
@@ -123,6 +124,7 @@ type ParsedCueCommand = {
   randomStep: number | null;
   transitionFromColor: string | null;
   transitionToColor: string | null;
+  audioReactive: "envelope" | "peaks" | null;
 };
 
 export type TimelineHistorySnapshot = {
@@ -164,6 +166,8 @@ const DEFAULT_TRACK_POINTS: Point[] = [{ time: 0, value: 0.25 }, { time: 8, valu
 type EffectEditorValues = {
   activeLength: number;
   spacingLength: number;
+  startRate: number;
+  endRate: number;
   intensity: number;
   minIntensity: number;
   maxIntensity: number;
@@ -176,6 +180,7 @@ type EffectEditorState =
   | { mode: "edit"; fixtureId: string; effectId: string; type: EffectType; values: EffectEditorValues };
 type ItemContextMenuState =
   | { kind: "color"; x: number; y: number; fixtureId: string; clipId: string }
+  | { kind: "colorLane"; x: number; y: number; fixtureId: string; time: number }
   | { kind: "colorTransition"; x: number; y: number; fixtureId: string; transitionId: string }
   | { kind: "strobe"; x: number; y: number; fixtureId: string; clipId: string }
   | { kind: "effect"; x: number; y: number; fixtureId: string; effectId: string };
@@ -184,6 +189,11 @@ type ColorTransitionEditorState = {
   leftClipId: string;
   rightClipId: string;
   duration: number;
+};
+type DuplicateSelectionDialogState = {
+  source: Selection;
+  targetFixtureId: string;
+  targetTime: number;
 };
 const rippleColors = (clips: ColorClip[], duration: number) => {
   let previousEnd = 0;
@@ -248,22 +258,28 @@ function cloneHistorySnapshot(snapshot: TimelineHistorySnapshot): TimelineHistor
 }
 
 function buildStageRowLayout(placements: StagePlacement[]) {
-  const sorted = [...placements].sort((left, right) => left.y - right.y);
-  const rows: Array<{ fixtureIds: string[]; center: number }> = [];
-  const tolerance = 0.075;
+  const sorted = [...placements].sort(
+    (left, right) => left.y - right.y || left.x - right.x,
+  );
+  const rowsByKey = new Map<string, { fixtureIds: string[]; center: number }>();
 
   sorted.forEach((placement) => {
-    const existingRow = rows.find((row) => Math.abs(row.center - placement.y) <= tolerance);
+    // Stage placements are snapped to a grid, so fixtures that truly share a
+    // row also share the same Y level. Group strictly by that snapped level so
+    // commands like "3rd row" always target the full row, not a fuzzy bucket.
+    const rowKey = placement.y.toFixed(4);
+    const existingRow = rowsByKey.get(rowKey);
     if (existingRow) {
       existingRow.fixtureIds.push(placement.fixtureId);
-      existingRow.center =
-        (existingRow.center * (existingRow.fixtureIds.length - 1) + placement.y) /
-        existingRow.fixtureIds.length;
       return;
     }
-
-    rows.push({ fixtureIds: [placement.fixtureId], center: placement.y });
+    rowsByKey.set(rowKey, {
+      fixtureIds: [placement.fixtureId],
+      center: placement.y,
+    });
   });
+
+  const rows = [...rowsByKey.values()].sort((left, right) => left.center - right.center);
 
   const rowByFixtureId = new Map<string, number>();
   rows.forEach((row, index) => {
@@ -303,7 +319,9 @@ function parseRequestedStageRow(normalized: string) {
     };
   }
 
-  const numericMatch = normalized.match(/\brow\s+(\d{1,2})\b|\b(\d{1,2})(?:st|nd|rd|th)\s+row\b/);
+  const numericMatch = normalized.match(
+    /\brow\s+(?:number\s+)?(\d{1,2})(?:st|nd|rd|th)?\b|\b(\d{1,2})(?:st|nd|rd|th)\s+row\b/,
+  );
   const numericValue = numericMatch?.[1] ?? numericMatch?.[2];
   if (numericValue) {
     const parsed = Number.parseInt(numericValue, 10);
@@ -410,7 +428,7 @@ function parseCueCommand(
   if (!targets.length) throw new Error("There are no fixtures to program.");
 
   const startMatch = normalized.match(
-    /(?:\bat\b|\bfrom\b|\bstarting(?:\s+at)?\b)\s*(\d+:\d+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(minutes?|mins?|m\b|seconds?|secs?|s\b)?/,
+    /(?:\bat\b|\bfrom\b|\bstarting(?:\s+at)?\b)\s*(?:(?:the|a)\s+)?(?:(?:section|time\s+interval)\s+(?:of|from)\s*)?(\d+:\d+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(minutes?|mins?|m\b|seconds?|secs?|s\b)?/,
   );
   const untilMatch = normalized.match(
     /\b(?:until|to)\s*(\d+:\d+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(minutes?|mins?|m\b|seconds?|secs?|s\b)?/,
@@ -443,6 +461,21 @@ function parseCueCommand(
 
   const clearStrobe = /\b(steady|strobe off|stop strobing|no strobe)\b/.test(normalized);
   const wantsPulse = /\b(pulse|pulsing|pulsate|pulsating|flash|flashing|blink|blinking)\b/.test(normalized);
+  const referencesAudio =
+    /\b(audio|mp3|song|music|waveform|beeps?|drum(?:\s+beats?)?|loud parts?|high points?)\b/.test(normalized);
+  const wantsAudioPeaks =
+    referencesAudio &&
+    /\b(beeps?|drum(?:\s+beats?)?|loud parts?|high points?|peaks?)\b/.test(normalized) &&
+    /\b(pulse|flash|blink|match|follow|react)\b/.test(normalized);
+  const wantsAudioEnvelope =
+    referencesAudio &&
+    !wantsAudioPeaks &&
+    /\b(match|follow|with the|rise|fade|intensity|react)\b/.test(normalized);
+  const audioReactive: ParsedCueCommand["audioReactive"] = wantsAudioPeaks
+    ? "peaks"
+    : wantsAudioEnvelope
+      ? "envelope"
+      : null;
   const wantsRandomIntensity =
     /\b(random|randomize|randomise|chaotic|scatter(?:ed)?|shimmer)\b/.test(normalized) &&
     /\b(intensity|dimmer|brightness|lights?)\b/.test(normalized);
@@ -455,7 +488,9 @@ function parseCueCommand(
     !wantsPulse &&
     !wantsRandomIntensity &&
     /\b(spline|smooth curve|curved|curve|ease(?:d|s)?|smoothly shaped)\b/.test(normalized);
-  let intensityEffect: ParsedCueCommand["intensityEffect"] = wantsPulse
+  let intensityEffect: ParsedCueCommand["intensityEffect"] = audioReactive
+    ? null
+    : wantsPulse
     ? "pulse"
     : wantsRandomIntensity
       ? "random"
@@ -550,12 +585,14 @@ function parseCueCommand(
   if ((color || strobeStartRate !== null) && intensity === null) intensity = 1;
   if (wantsColorTransition && intensity === null) intensity = 1;
   if (intensityEffect && intensity === null) intensity = 1;
+  if (audioReactive && intensity === null) intensity = 1;
   if (
     intensity === null &&
     !color &&
     strobeStartRate === null &&
     !clearStrobe &&
     !intensityEffect &&
+    !audioReactive &&
     !wantsColorTransition
   ) {
     throw new Error(
@@ -581,11 +618,16 @@ function parseCueCommand(
     randomStep,
     transitionFromColor,
     transitionToColor,
+    audioReactive,
   };
 }
 const documentSignature = (document: TimelineDocumentData | null) => JSON.stringify(document ?? null);
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
 const clampRate = (value: number) => Math.min(30, Math.max(0.5, value));
+const truncateAudioLabel = (name: string, maximumLength = 25) =>
+  name.length <= maximumLength
+    ? name
+    : `${name.slice(0, Math.max(0, maximumLength - 3))}...`;
 const lerp = (start: number, end: number, amount: number) => start + (end - start) * amount;
 const seededRandom = (seed: number) => {
   const x = Math.sin(seed) * 10000;
@@ -613,6 +655,8 @@ function effectToEditorValues(effect: IntensityEffect): EffectEditorValues {
     return {
       activeLength: effect.activeLength,
       spacingLength: effect.spacingLength,
+      startRate: effect.startRate ?? 1 / Math.max(0.05, effect.activeLength + effect.spacingLength),
+      endRate: effect.endRate ?? effect.startRate ?? 1 / Math.max(0.05, effect.activeLength + effect.spacingLength),
       intensity: effect.intensity,
       minIntensity: 0,
       maxIntensity: effect.intensity,
@@ -625,6 +669,8 @@ function effectToEditorValues(effect: IntensityEffect): EffectEditorValues {
     return {
       activeLength: effect.duration,
       spacingLength: 0.25,
+      startRate: 2.5,
+      endRate: 2.5,
       intensity: 1,
       minIntensity: 0,
       maxIntensity: 1,
@@ -637,6 +683,8 @@ function effectToEditorValues(effect: IntensityEffect): EffectEditorValues {
     return {
       activeLength: effect.step,
       spacingLength: effect.step,
+      startRate: 2.5,
+      endRate: 2.5,
       intensity: 1,
       minIntensity: 0,
       maxIntensity: 1,
@@ -648,6 +696,8 @@ function effectToEditorValues(effect: IntensityEffect): EffectEditorValues {
   return {
     activeLength: Math.min(effect.duration, effect.length),
     spacingLength: Math.max(0.25, effect.duration - effect.length),
+    startRate: 2.5,
+    endRate: 2.5,
     intensity: effect.maxIntensity,
     minIntensity: effect.minIntensity,
     maxIntensity: effect.maxIntensity,
@@ -727,6 +777,8 @@ function createDefaultEffectEditorValues(_type: EffectType, span: number, grid: 
   return {
     activeLength: Math.max(grid, Math.min(span, Math.max(grid, span * 0.25))),
     spacingLength: Math.max(grid, Math.min(span, Math.max(grid, span * 0.15))),
+    startRate: 2.5,
+    endRate: 2.5,
     intensity: 1,
     minIntensity: 0,
     maxIntensity: 1,
@@ -753,6 +805,8 @@ function buildEffectFromEditor(
       activeLength: Math.max(0.05, values.activeLength),
       spacingLength: Math.max(0.05, values.spacingLength),
       intensity: clamp01(values.intensity),
+      startRate: clampRate(values.startRate),
+      endRate: clampRate(values.endRate),
     };
   }
   if (type === "spline") {
@@ -857,6 +911,64 @@ function buildEffectPoints(effect: IntensityEffect): Point[] {
   ]);
 }
 
+function buildAudioReactivePoints(
+  samples: number[],
+  audioDuration: number,
+  start: number,
+  end: number,
+  mode: "envelope" | "peaks",
+  maximumIntensity: number,
+) {
+  if (!samples.length || audioDuration <= 0 || end <= start) return [];
+  const startIndex = Math.max(0, Math.floor((start / audioDuration) * (samples.length - 1)));
+  const endIndex = Math.min(
+    samples.length - 1,
+    Math.ceil((end / audioDuration) * (samples.length - 1)),
+  );
+  const region = samples.slice(startIndex, endIndex + 1);
+  if (!region.length) return [];
+  const sampleTime = (index: number) =>
+    Math.min(end, Math.max(start, ((startIndex + index) / (samples.length - 1)) * audioDuration));
+
+  if (mode === "peaks") {
+    const sorted = [...region].sort((left, right) => left - right);
+    const threshold = sorted[Math.floor(sorted.length * 0.78)] ?? 0.7;
+    const minimumGap = 0.16;
+    const attackLead = 0.035;
+    const points: Point[] = [{ time: start, value: 0 }];
+    let lastPeakTime = start - minimumGap;
+    for (let index = 1; index < region.length - 1; index += 1) {
+      const value = region[index];
+      if (value < threshold || value < region[index - 1] || value <= region[index + 1]) continue;
+      const time = Math.max(start, sampleTime(index) - attackLead);
+      if (time - lastPeakTime < minimumGap) continue;
+      const shoulder = Math.min(0.06, minimumGap / 3);
+      points.push(
+        { time: Math.max(start, time - shoulder), value: 0 },
+        { time, value: maximumIntensity },
+        { time: Math.min(end, time + shoulder), value: 0 },
+      );
+      lastPeakTime = time;
+    }
+    points.push({ time: end, value: 0 });
+    return normalizePoints(points);
+  }
+
+  const minimum = region.reduce((lowest, value) => Math.min(lowest, value), 1);
+  const maximum = region.reduce((highest, value) => Math.max(highest, value), 0);
+  const stride = Math.max(1, Math.ceil(region.length / 100));
+  const points: Point[] = [];
+  for (let index = 0; index < region.length; index += stride) {
+    const normalized = (region[index] - minimum) / Math.max(0.001, maximum - minimum);
+    points.push({ time: sampleTime(index), value: clamp01(normalized * maximumIntensity) });
+  }
+  points.push({
+    time: end,
+    value: clamp01(((region[region.length - 1] - minimum) / Math.max(0.001, maximum - minimum)) * maximumIntensity),
+  });
+  return normalizePoints(points);
+}
+
 function normalizeTrackData(track?: Partial<TrackData> | null): TrackData {
   return {
     points: normalizePoints(track?.points?.map((point) => ({ ...point })) ?? DEFAULT_TRACK_POINTS.map((point) => ({ ...point }))),
@@ -939,6 +1051,7 @@ export default function TimelineEditor({
   volume,
   onVolumeChange,
   onHistoryStateChange,
+  previewMinimizedCues,
 }: {
   fixtures: PatchedFixture[];
   onOutputFrame: (
@@ -965,6 +1078,7 @@ export default function TimelineEditor({
   volume: number;
   onVolumeChange: (volume: number) => void;
   onHistoryStateChange: (history: TimelineHistoryState) => void;
+  previewMinimizedCues: boolean;
 }) {
   const rootRef = useRef<HTMLElement>(null);
   const [zoom, setZoom] = useState(initialDocumentState?.zoom ?? 80);
@@ -1000,6 +1114,8 @@ export default function TimelineEditor({
   const [transitionClipboard, setTransitionClipboard] = useState<ColorTransition | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [itemContextMenu, setItemContextMenu] = useState<ItemContextMenuState | null>(null);
+  const [duplicateSelectionDialog, setDuplicateSelectionDialog] =
+    useState<DuplicateSelectionDialogState | null>(null);
   const [colorTransitionEditor, setColorTransitionEditor] =
     useState<ColorTransitionEditorState | null>(null);
   const [tracks, setTracks] = useState<Record<string, TrackData>>(
@@ -1028,6 +1144,13 @@ export default function TimelineEditor({
   const fixtureTracksRef = useRef<HTMLDivElement>(null);
   const scrollRafRef = useRef<number | null>(null);
   const pendingScrollRef = useRef(0);
+  const autoFollowPlayheadRef = useRef(playhead);
+  const zoomingViewportRef = useRef(false);
+  const zoomSliderRef = useRef<HTMLInputElement>(null);
+  const zoomSliderTimerRef = useRef<number | null>(null);
+  const pendingSliderZoomRef = useRef<number | null>(null);
+  const wheelZoomFrameRef = useRef<number | null>(null);
+  const pendingWheelZoomRef = useRef<number | null>(null);
   const selectionGestureRef = useRef(false);
   const audioRef = useRef<HTMLAudioElement>(null);
   const audioUrlRef = useRef("");
@@ -1047,12 +1170,23 @@ export default function TimelineEditor({
       ? initialDocumentState.waveform
       : createPlaceholderWaveform(180),
   );
-  const timelineScale = Math.max(
-    zoom,
-    Math.max(1, viewportWidth - LABEL_WIDTH) / Math.max(1, duration),
+  const trackPreviewSnapshotRef = useRef<Map<string, TimelineHistorySnapshot>>(new Map());
+  const minimumZoom = Math.min(
+    240,
+    Math.max(
+      0.5,
+      (Math.max(360, viewportWidth) - LABEL_WIDTH) / Math.max(1, duration),
+    ),
   );
-  const contentWidth = duration * timelineScale;
-  const beatTimes = getBeatTimes(beatgrid, duration);
+  const timelineScale = zoom;
+  const contentWidth = Math.max(
+    duration * timelineScale,
+    Math.max(360, viewportWidth - LABEL_WIDTH),
+  );
+  const beatTimes = useMemo(
+    () => getBeatTimes(beatgrid, duration),
+    [beatgrid, duration],
+  );
   const fixtureGroupByFixtureId = new Map<string, FixtureGroup>();
   fixtureGroups.forEach((group) =>
     group.fixtureIds.forEach((fixtureId) => fixtureGroupByFixtureId.set(fixtureId, group)),
@@ -1236,6 +1370,7 @@ export default function TimelineEditor({
         ? initialDocumentState.waveform
         : createPlaceholderWaveform(180),
     );
+    trackPreviewSnapshotRef.current.clear();
     undoStackRef.current = initialHistoryState?.undo.map(cloneHistorySnapshot) ?? [];
     redoStackRef.current = initialHistoryState?.redo.map(cloneHistorySnapshot) ?? [];
     syncHistoryState();
@@ -1309,8 +1444,31 @@ export default function TimelineEditor({
   }, [contentWidth, viewportWidth]);
 
   useEffect(() => {
+    if (zoom >= minimumZoom) return;
+    setZoom(minimumZoom);
+  }, [minimumZoom, zoom]);
+
+  useEffect(() => {
+    if (zoomSliderRef.current) {
+      zoomSliderRef.current.value = String(zoom);
+    }
+  }, [zoom]);
+
+  useEffect(() => () => {
+    if (zoomSliderTimerRef.current !== null) {
+      window.clearTimeout(zoomSliderTimerRef.current);
+    }
+    if (wheelZoomFrameRef.current !== null) {
+      window.cancelAnimationFrame(wheelZoomFrameRef.current);
+    }
+  }, []);
+
+  useEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
+    if (zoomingViewportRef.current) return;
+    if (Math.abs(playhead - autoFollowPlayheadRef.current) < 0.0001) return;
+    autoFollowPlayheadRef.current = playhead;
 
     const playheadX = LABEL_WIDTH + playhead * timelineScale;
     const visibleLeft = viewport.scrollLeft;
@@ -1329,6 +1487,7 @@ export default function TimelineEditor({
       );
       if (Math.abs(nextScroll - viewport.scrollLeft) > 1) {
         viewport.scrollLeft = nextScroll;
+        viewport.style.setProperty("--track-scroll", `${nextScroll}px`);
         setScrollPosition(nextScroll);
       }
       return;
@@ -1338,6 +1497,7 @@ export default function TimelineEditor({
       const nextScroll = Math.max(0, playheadX - leftPadding);
       if (Math.abs(nextScroll - viewport.scrollLeft) > 1) {
         viewport.scrollLeft = nextScroll;
+        viewport.style.setProperty("--track-scroll", `${nextScroll}px`);
         setScrollPosition(nextScroll);
       }
     }
@@ -1370,46 +1530,6 @@ export default function TimelineEditor({
     observer.observe(viewport);
     return () => observer.disconnect();
   }, []);
-
-  useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-
-    const handleNativeWheel = (event: WheelEvent) => {
-      if (!event.altKey) return;
-      event.preventDefault();
-      event.stopPropagation();
-      setZoomAroundClientX(zoom - event.deltaY * 0.12, event.clientX);
-    };
-
-    viewport.addEventListener("wheel", handleNativeWheel, {
-      passive: false,
-      capture: true,
-    });
-
-    return () => {
-      viewport.removeEventListener("wheel", handleNativeWheel, true);
-    };
-  }, [zoom, timelineScale, duration]);
-
-  useEffect(() => {
-    const handleRootAltWheel = (event: WheelEvent) => {
-      if (!event.altKey) return;
-      if (!rootRef.current?.contains(event.target as Node)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      setZoomAroundClientX(zoom - event.deltaY * 0.12, event.clientX);
-    };
-
-    window.addEventListener("wheel", handleRootAltWheel, {
-      passive: false,
-      capture: true,
-    });
-
-    return () => {
-      window.removeEventListener("wheel", handleRootAltWheel, true);
-    };
-  }, [zoom, timelineScale, duration]);
 
   useEffect(() => () => {
     if (scrollRafRef.current !== null) {
@@ -1490,15 +1610,38 @@ export default function TimelineEditor({
     onDocumentStateChange,
   ]);
 
-  function updateTrack(fixtureId: string, data: TrackData) {
-    pushUndoSnapshot(currentHistorySnapshot());
+  function updateTrack(
+    fixtureId: string,
+    data: TrackData,
+    mode: TrackChangeMode = "commit",
+  ) {
+    const normalized = normalizeTrackData(data);
+    if (mode === "preview") {
+      if (!trackPreviewSnapshotRef.current.has(fixtureId)) {
+        trackPreviewSnapshotRef.current.set(fixtureId, currentHistorySnapshot());
+      }
+      setTracks((previous) => ({
+        ...previous,
+        [fixtureId]: normalized,
+      }));
+      return;
+    }
+
+    const previewSnapshot = trackPreviewSnapshotRef.current.get(fixtureId);
+    if (previewSnapshot) {
+      pushUndoSnapshot(previewSnapshot);
+      trackPreviewSnapshotRef.current.delete(fixtureId);
+    } else {
+      pushUndoSnapshot(currentHistorySnapshot());
+    }
     setTracks((previous) => ({
       ...previous,
-      [fixtureId]: normalizeTrackData(data),
+      [fixtureId]: normalized,
     }));
   }
 
   function commitTracks(nextTracks: Record<string, TrackData>) {
+    trackPreviewSnapshotRef.current.clear();
     pushUndoSnapshot(currentHistorySnapshot());
     setTracks(nextTracks);
   }
@@ -1523,6 +1666,9 @@ export default function TimelineEditor({
       const nextDuration = Math.max(duration, Math.ceil(command.end + 1));
       const nextTracks = { ...tracks };
       const epsilon = Math.min(0.01, grid / 10);
+      if (command.audioReactive && !audioName) {
+        throw new Error("Choose an MP3 or audio file before creating an audio-reactive cue.");
+      }
 
       command.fixtureIds.forEach((fixtureId) => {
         const track = normalizeTrackData(nextTracks[fixtureId]);
@@ -1532,7 +1678,21 @@ export default function TimelineEditor({
           start < regionEnd && start + clipDuration > regionStart;
 
         let points = track.points;
-        if (command.intensity !== null && !command.intensityEffect) {
+        if (command.audioReactive) {
+          points = [
+            ...track.points.filter(
+              (point) => point.time < regionStart - epsilon || point.time > regionEnd + epsilon,
+            ),
+            ...buildAudioReactivePoints(
+              waveform,
+              duration,
+              regionStart,
+              regionEnd,
+              command.audioReactive,
+              command.intensity ?? 1,
+            ),
+          ];
+        } else if (command.intensity !== null && !command.intensityEffect) {
           const beforeValue = evaluateTrackAtPlayhead(track, Math.max(0, regionStart - epsilon));
           const afterValue = evaluateTrackAtPlayhead(track, Math.min(duration, regionEnd + epsilon));
           points = [
@@ -1683,10 +1843,12 @@ export default function TimelineEditor({
         command.intensityEffect === "spline" ? "smooth spline curve" : "",
         command.intensityEffect === "fade" ? "gradual fade out" : "",
         command.intensityEffect === "rise" ? "gradual fade in" : "",
+        command.audioReactive === "peaks" ? "audio peak pulses" : "",
+        command.audioReactive === "envelope" ? "audio-following intensity" : "",
         command.transitionFromColor && command.transitionToColor
           ? `${command.transitionFromColor.toUpperCase()} → ${command.transitionToColor.toUpperCase()} color transition`
           : "",
-        command.intensity !== null && !command.intensityEffect
+        command.intensity !== null && !command.intensityEffect && !command.audioReactive
           ? `${Math.round(command.intensity * 100)}% intensity`
           : "",
         command.color ? command.color.toUpperCase() : "",
@@ -1795,6 +1957,7 @@ export default function TimelineEditor({
   function undoLastChange() {
     const previous = undoStackRef.current.pop();
     if (previous) {
+      trackPreviewSnapshotRef.current.clear();
       redoStackRef.current.push(currentHistorySnapshot());
       setTracks(cloneTrackMap(previous.tracks));
       setDuration(previous.duration);
@@ -1808,6 +1971,7 @@ export default function TimelineEditor({
   function redoLastChange() {
     const next = redoStackRef.current.pop();
     if (next) {
+      trackPreviewSnapshotRef.current.clear();
       undoStackRef.current.push(currentHistorySnapshot());
       setTracks(cloneTrackMap(next.tracks));
       setDuration(next.duration);
@@ -2120,6 +2284,10 @@ export default function TimelineEditor({
 
   function deleteItemFromContextMenu() {
     if (!itemContextMenu) return;
+    if (itemContextMenu.kind === "colorLane") {
+      setItemContextMenu(null);
+      return;
+    }
     const track = tracks[itemContextMenu.fixtureId];
     if (!track) return;
 
@@ -2175,18 +2343,18 @@ export default function TimelineEditor({
     setItemContextMenu(null);
   }
 
-  function copySelection() {
-    const selection = selections[selections.length - 1] ?? null;
-    if (!selection) return;
+  function selectionToClipboard(selection: Selection): TrackData | null {
     const source = tracks[selection.fixtureId];
-    if (!source) return;
+    if (!source) return null;
     const start = Math.min(selection.start, selection.end);
     const end = Math.max(selection.start, selection.end);
-    setClipboard({
+    return {
       curve: source.curve,
-      points: source.points.filter((point) => point.time >= start && point.time <= end)
+      points: source.points
+        .filter((point) => point.time >= start && point.time <= end)
         .map((point) => ({ ...point, time: point.time - start })),
-      colors: source.colors.filter((clip) => clip.start < end && clip.start + clip.duration > start)
+      colors: source.colors
+        .filter((clip) => clip.start < end && clip.start + clip.duration > start)
         .map((clip) => ({ ...clip, id: uid(), start: Math.max(0, clip.start - start) })),
       colorTransitions: source.colorTransitions
         .filter(
@@ -2201,12 +2369,111 @@ export default function TimelineEditor({
           fromColor: transition.fromColor,
           toColor: transition.toColor,
         })),
-      strobes: source.strobes.filter((clip) => clip.start < end && clip.start + clip.duration > start)
+      strobes: source.strobes
+        .filter((clip) => clip.start < end && clip.start + clip.duration > start)
         .map((clip) => ({ ...clip, id: uid(), start: Math.max(0, clip.start - start) })),
       effects: source.effects
         .filter((effect) => effect.start < end && effect.start + effect.duration > start)
         .map((effect) => ({ ...effect, id: uid(), start: Math.max(0, effect.start - start) })),
+    };
+  }
+
+  function copySelection() {
+    const selection = selections[selections.length - 1] ?? null;
+    if (!selection) return;
+    const nextClipboard = selectionToClipboard(selection);
+    if (nextClipboard) setClipboard(nextClipboard);
+  }
+
+  function duplicateSelectedRegion() {
+    if (!duplicateSelectionDialog) return;
+    const duplicated = selectionToClipboard(duplicateSelectionDialog.source);
+    const target = tracks[duplicateSelectionDialog.targetFixtureId];
+    if (!duplicated || !target) return;
+    const targetTime = Math.min(duration, Math.max(0, duplicateSelectionDialog.targetTime));
+    updateTrack(duplicateSelectionDialog.targetFixtureId, {
+      curve: duplicated.curve,
+      points: [
+        ...target.points,
+        ...duplicated.points.map((point) => ({
+          ...point,
+          time: point.time + targetTime,
+        })),
+      ]
+        .filter((point) => point.time <= duration)
+        .sort((left, right) => left.time - right.time),
+      colors: rippleColors(
+        [
+          ...target.colors,
+          ...duplicated.colors.map((clip) => ({
+            ...clip,
+            id: uid(),
+            start: clip.start + targetTime,
+          })),
+        ].sort((left, right) => left.start - right.start),
+        duration,
+      ),
+      colorTransitions: [
+        ...target.colorTransitions,
+        ...duplicated.colorTransitions.map((transition) => ({
+          ...transition,
+          id: uid(),
+          start: transition.start + targetTime,
+        })),
+      ],
+      strobes: [
+        ...target.strobes,
+        ...duplicated.strobes.map((clip) => ({
+          ...clip,
+          id: uid(),
+          start: clip.start + targetTime,
+        })),
+      ],
+      effects: [
+        ...target.effects,
+        ...duplicated.effects.map((effect) => ({
+          ...effect,
+          id: uid(),
+          start: effect.start + targetTime,
+        })),
+      ],
     });
+    setSelectedFixtureId(duplicateSelectionDialog.targetFixtureId);
+    setDuplicateSelectionDialog(null);
+  }
+
+  function addColorFromContextMenu() {
+    if (!itemContextMenu || itemContextMenu.kind !== "colorLane") return;
+    const track = tracks[itemContextMenu.fixtureId];
+    if (!track) return;
+    const start = Math.min(duration, Math.max(0, snap(itemContextMenu.time, grid)));
+    const nextClipStart = track.colors
+      .filter((clip) => clip.start > start)
+      .reduce((earliest, clip) => Math.min(earliest, clip.start), duration);
+    const clipDuration = Math.min(
+      Math.max(grid, 1),
+      Math.max(0, nextClipStart - start),
+      Math.max(0, duration - start),
+    );
+    if (clipDuration <= 0) {
+      setItemContextMenu(null);
+      return;
+    }
+    const clipId = uid();
+    updateTrack(itemContextMenu.fixtureId, {
+      ...track,
+      colors: [
+        ...track.colors,
+        {
+          id: clipId,
+          start,
+          duration: clipDuration,
+          color: "#ffffff",
+        },
+      ].sort((left, right) => left.start - right.start),
+    });
+    setSelectedColorKey(`${itemContextMenu.fixtureId}:${clipId}`);
+    setItemContextMenu(null);
   }
 
   function pasteSelection() {
@@ -2325,39 +2592,81 @@ export default function TimelineEditor({
     const time =
       (clientX - bounds.left + viewport.scrollLeft - LABEL_WIDTH) /
       timelineScale;
-    const next = Math.min(duration, snap(time, grid));
+    const next = Math.min(duration, Math.max(0, time));
     setPlayhead(next);
     if (audioRef.current?.src) audioRef.current.currentTime = next;
   }
 
-  function setZoomAroundClientX(nextZoom: number, clientX: number) {
+  function setZoomAroundViewportCenter(nextZoom: number) {
     const viewport = viewportRef.current;
     if (!viewport) {
       setZoom(nextZoom);
       return;
     }
 
-    const boundedZoom = Math.min(240, Math.max(25, nextZoom));
-    const bounds = viewport.getBoundingClientRect();
-    const pointerTime =
-      (clientX - bounds.left + viewport.scrollLeft - LABEL_WIDTH) / timelineScale;
+    const boundedZoom = Math.min(240, Math.max(minimumZoom, nextZoom));
+    const centerTime =
+      (viewport.scrollLeft + viewport.clientWidth / 2 - LABEL_WIDTH) / timelineScale;
+    const updatedScale = boundedZoom;
+    const updatedContentWidth = Math.max(
+      duration * updatedScale,
+      Math.max(360, viewport.clientWidth - LABEL_WIDTH),
+    );
+    const targetScroll =
+      LABEL_WIDTH + Math.max(0, centerTime) * updatedScale - viewport.clientWidth / 2;
+    const maximumScroll = Math.max(
+      0,
+      LABEL_WIDTH + updatedContentWidth - viewport.clientWidth,
+    );
+    const nextScroll = Math.min(maximumScroll, Math.max(0, targetScroll));
 
+    // Keep the pinned fixture-info cards in sync with the new scroll anchor in
+    // the same frame as the zoom update so they do not drift and snap back.
+    zoomingViewportRef.current = true;
+    viewport.scrollLeft = nextScroll;
+    viewport.style.setProperty("--track-scroll", `${nextScroll}px`);
+    pendingScrollRef.current = nextScroll;
+    setScrollPosition(nextScroll);
     setZoom(boundedZoom);
-
     requestAnimationFrame(() => {
-      const updatedScale = Math.max(
-        boundedZoom,
-        Math.max(1, viewport.clientWidth - LABEL_WIDTH) / Math.max(1, duration),
-      );
-      const targetScroll =
-        LABEL_WIDTH + Math.max(0, pointerTime) * updatedScale - (clientX - bounds.left);
-      const maximumScroll = Math.max(
-        0,
-        LABEL_WIDTH + duration * updatedScale - viewport.clientWidth,
-      );
-      const nextScroll = Math.min(maximumScroll, Math.max(0, targetScroll));
-      viewport.scrollLeft = nextScroll;
-      setScrollPosition(nextScroll);
+      zoomingViewportRef.current = false;
+      autoFollowPlayheadRef.current = playhead;
+    });
+  }
+
+  function queueSliderZoom(nextZoom: number) {
+    pendingSliderZoomRef.current = nextZoom;
+    if (zoomSliderTimerRef.current !== null) return;
+    zoomSliderTimerRef.current = window.setTimeout(() => {
+      zoomSliderTimerRef.current = null;
+      const pendingZoom = pendingSliderZoomRef.current;
+      pendingSliderZoomRef.current = null;
+      if (pendingZoom !== null) {
+        setZoomAroundViewportCenter(pendingZoom);
+      }
+    }, 32);
+  }
+
+  function commitSliderZoom(nextZoom: number) {
+    if (zoomSliderTimerRef.current !== null) {
+      window.clearTimeout(zoomSliderTimerRef.current);
+      zoomSliderTimerRef.current = null;
+    }
+    pendingSliderZoomRef.current = null;
+    setZoomAroundViewportCenter(nextZoom);
+  }
+
+  function queueWheelZoom(delta: number) {
+    const baseZoom = pendingWheelZoomRef.current ?? zoom;
+    pendingWheelZoomRef.current = baseZoom - delta * 0.12;
+    if (wheelZoomFrameRef.current !== null) return;
+    wheelZoomFrameRef.current = window.requestAnimationFrame(() => {
+      wheelZoomFrameRef.current = null;
+      const pendingZoom = pendingWheelZoomRef.current;
+      pendingWheelZoomRef.current = null;
+      if (pendingZoom !== null) {
+        setZoomAroundViewportCenter(pendingZoom);
+      }
     });
   }
 
@@ -2365,13 +2674,29 @@ export default function TimelineEditor({
     if (event.altKey) {
       event.preventDefault();
       event.stopPropagation();
-      setZoomAroundClientX(zoom - event.deltaY * 0.12, event.clientX);
+      queueWheelZoom(event.deltaY);
       return;
     }
     if (!event.ctrlKey || !viewportRef.current) return;
     event.preventDefault();
     viewportRef.current.scrollLeft += event.deltaY || event.deltaX;
   }
+
+  useEffect(() => {
+    const suppressAltWheelScroll = (event: WheelEvent) => {
+      if (!event.altKey) return;
+      const root = rootRef.current;
+      if (!root || !(event.target instanceof Node) || !root.contains(event.target)) return;
+      event.preventDefault();
+    };
+    window.addEventListener("wheel", suppressAltWheelScroll, {
+      capture: true,
+      passive: false,
+    });
+    return () => {
+      window.removeEventListener("wheel", suppressAltWheelScroll, true);
+    };
+  }, []);
 
   function handleViewportScroll(event: React.UIEvent<HTMLDivElement>) {
     const viewport = event.currentTarget;
@@ -2577,7 +2902,17 @@ export default function TimelineEditor({
             </label>
           </div>
           <label className="zoomControl toolbarZoomControl"><span>Horizontal zoom</span>
-            <input type="range" min="25" max="240" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} />
+            <input
+              ref={zoomSliderRef}
+              type="range"
+              min={minimumZoom}
+              max="240"
+              step="0.1"
+              defaultValue={zoom}
+              onInput={(event) => queueSliderZoom(Number(event.currentTarget.value))}
+              onPointerUp={(event) => commitSliderZoom(Number(event.currentTarget.value))}
+              onKeyUp={(event) => commitSliderZoom(Number(event.currentTarget.value))}
+            />
             <strong>{Math.round((zoom / 80) * 100)}%</strong>
           </label>
         </div>
@@ -2585,7 +2920,10 @@ export default function TimelineEditor({
           <button className={selectionMode ? "toolActive" : ""} onClick={() => setSelectionMode(!selectionMode)}>Select range</button>
           <button disabled={!selections.length} onClick={copySelection}>Copy</button>
           <button disabled={!clipboard || !selectedFixtureId} onClick={pasteSelection}>Paste at marker</button>
-          <label className="audioPicker"><span>{audioName || "Choose audio"}</span>
+          <label className="audioPicker">
+            <span title={audioName || "Choose audio"}>
+              {audioName ? truncateAudioLabel(audioName) : "Choose audio"}
+            </span>
             <input type="file" accept="audio/*" onChange={(event) => {
               const file = event.target.files?.[0];
               if (file) void loadAudio(file);
@@ -2848,7 +3186,6 @@ export default function TimelineEditor({
                 event.currentTarget.releasePointerCapture(event.pointerId);
               }
             }}
-            onWheel={handleTimelineWheel}
             onContextMenu={(event) => {
               event.preventDefault();
               setTimeAt(event.clientX);
@@ -2922,6 +3259,7 @@ export default function TimelineEditor({
                   <FixtureTrack key={item.fixture.id} fixture={item.fixture}
                     data={tracks[item.fixture.id]} zoom={timelineScale} grid={grid} duration={duration}
                     beatTimes={beatTimes}
+                    previewMinimizedCues={previewMinimizedCues}
                     width={contentWidth} selected={selectedFixtureId === item.fixture.id}
                     selection={selections.find((selection) => selection.fixtureId === item.fixture.id) ?? null}
                     onPreviewColorChange={onColorPreviewChange}
@@ -2943,7 +3281,7 @@ export default function TimelineEditor({
                         selectSingleFixture(nextSelection.fixtureId);
                       }
                     }}
-                    onChange={(data) => updateTrack(item.fixture.id, data)}
+                    onChange={(data, mode) => updateTrack(item.fixture.id, data, mode)}
                     onMoveFixture={reorderFixture}
                     onPan={(delta) => { if (viewportRef.current) viewportRef.current.scrollLeft -= delta; }} />
                 ) : (
@@ -2959,6 +3297,7 @@ export default function TimelineEditor({
                     duration={duration}
                     width={contentWidth}
                     beatTimes={beatTimes}
+                    previewMinimizedCues={previewMinimizedCues}
                     selected={selectedFixtureId === item.group.id}
                     selectedChildFixtureId={selectedFixtureId}
                     expanded={expandedGroupIds.includes(item.group.id)}
@@ -2997,8 +3336,8 @@ export default function TimelineEditor({
                       });
                       if (nextSelection) selectSingleFixture(fixtureId);
                     }}
-                    onChange={(data) => updateTrack(item.group.id, data)}
-                    onChildChange={(fixtureId, data) => updateTrack(fixtureId, data)}
+                    onChange={(data, mode) => updateTrack(item.group.id, data, mode)}
+                    onChildChange={(fixtureId, data, mode) => updateTrack(fixtureId, data, mode)}
                     onMoveFixture={reorderFixture}
                     onPan={(delta) => { if (viewportRef.current) viewportRef.current.scrollLeft -= delta; }}
                   />
@@ -3066,6 +3405,21 @@ export default function TimelineEditor({
           <button disabled={!clipboard || !selectedFixtureId} onClick={() => { pasteSelection(); setContextMenu(null); }}>
             Paste
           </button>
+          <button
+            disabled={!selections.length}
+            onClick={() => {
+              const source = selections[selections.length - 1];
+              if (!source) return;
+              setDuplicateSelectionDialog({
+                source,
+                targetFixtureId: source.fixtureId,
+                targetTime: playhead,
+              });
+              setContextMenu(null);
+            }}
+          >
+            Duplicate
+          </button>
           <button disabled={!selections.length} onClick={() => { deleteSelection(); setContextMenu(null); }}>
             Delete
           </button>
@@ -3097,6 +3451,11 @@ export default function TimelineEditor({
           >
             Redo
           </button>
+          {itemContextMenu.kind === "colorLane" ? (
+            <button type="button" onClick={addColorFromContextMenu}>
+              Add color
+            </button>
+          ) : null}
           {itemContextMenu.kind === "colorTransition" ? (
             <button type="button" onClick={copyTransitionFromContextMenu}>
               Copy transition
@@ -3109,10 +3468,96 @@ export default function TimelineEditor({
           >
             Paste transition
           </button>
-          <hr />
-          <button type="button" onClick={deleteItemFromContextMenu}>
-            Delete
-          </button>
+          {itemContextMenu.kind !== "colorLane" ? (
+            <>
+              <hr />
+              <button type="button" onClick={deleteItemFromContextMenu}>
+                Delete
+              </button>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+      {duplicateSelectionDialog ? (
+        <div
+          className="effectDialogBackdrop"
+          onPointerDown={() => setDuplicateSelectionDialog(null)}
+        >
+          <div
+            className="effectDialog duplicateSelectionDialog"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <div className="effectDialogHeader">
+              <div>
+                <strong>Duplicate selected cues</strong>
+                <span>Choose the destination fixture and start time.</span>
+              </div>
+              <button type="button" onClick={() => setDuplicateSelectionDialog(null)}>
+                ×
+              </button>
+            </div>
+            <label>
+              Destination fixture
+              <select
+                value={duplicateSelectionDialog.targetFixtureId}
+                onChange={(event) =>
+                  setDuplicateSelectionDialog((previous) =>
+                    previous
+                      ? { ...previous, targetFixtureId: event.target.value }
+                      : previous,
+                  )
+                }
+              >
+                {fixtures.map((fixture) => (
+                  <option key={fixture.id} value={fixture.id}>
+                    {fixture.name}
+                  </option>
+                ))}
+                {fixtureGroups.map((group) => (
+                  <option key={group.id} value={group.id}>
+                    {group.name} (group)
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Start time
+              <div className="transitionDurationInput">
+                <input
+                  type="number"
+                  min="0"
+                  max={duration}
+                  step={grid}
+                  value={duplicateSelectionDialog.targetTime}
+                  onChange={(event) =>
+                    setDuplicateSelectionDialog((previous) =>
+                      previous
+                        ? {
+                            ...previous,
+                            targetTime: Math.min(
+                              duration,
+                              Math.max(0, Number(event.target.value)),
+                            ),
+                          }
+                        : previous,
+                    )
+                  }
+                />
+                <span>seconds</span>
+              </div>
+            </label>
+            <div className="effectDialogActions">
+              <span />
+              <div>
+                <button type="button" onClick={() => setDuplicateSelectionDialog(null)}>
+                  Cancel
+                </button>
+                <button type="button" className="primaryButton" onClick={duplicateSelectedRegion}>
+                  Duplicate
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       ) : null}
       {colorTransitionEditor ? (
@@ -3237,6 +3682,38 @@ export default function TimelineEditor({
                       }
                     />
                   </label>
+                  <label>
+                    Starting speed (Hz)
+                    <input
+                      type="number"
+                      min="0.5"
+                      max="30"
+                      step="0.1"
+                      value={effectEditor.values.startRate}
+                      onChange={(event) =>
+                        setEffectEditor((previous) => previous ? {
+                          ...previous,
+                          values: { ...previous.values, startRate: Number(event.target.value) },
+                        } : previous)
+                      }
+                    />
+                  </label>
+                  <label>
+                    Ending speed (Hz)
+                    <input
+                      type="number"
+                      min="0.5"
+                      max="30"
+                      step="0.1"
+                      value={effectEditor.values.endRate}
+                      onChange={(event) =>
+                        setEffectEditor((previous) => previous ? {
+                          ...previous,
+                          values: { ...previous.values, endRate: Number(event.target.value) },
+                        } : previous)
+                      }
+                    />
+                  </label>
                 </>
               ) : (
                 <>
@@ -3339,21 +3816,92 @@ export default function TimelineEditor({
   );
 }
 
-function TimeRuler({ duration, zoom, width }: { duration: number; zoom: number; width: number }) {
+const TimeRuler = memo(function TimeRuler({ duration, zoom, width }: { duration: number; zoom: number; width: number }) {
   return <div className="timeRuler" style={{ left: LABEL_WIDTH, width }}>
     {Array.from({ length: Math.floor(duration) + 1 }, (_, seconds) => <span key={seconds}
       className={seconds % 5 === 0 ? "majorTick" : ""} style={{ left: seconds * zoom }}>
       {seconds % 5 === 0 ? `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}` : ""}
     </span>)}
   </div>;
-}
+});
 
-function FixtureTrack({ fixture, data, zoom, grid, duration, width, selected, selection,
+const CollapsedFixturePreview = memo(function CollapsedFixturePreview({
+  data,
+  duration,
+  width,
+}: {
+  data: TrackData;
+  duration: number;
+  width: number;
+}) {
+  const safeDuration = Math.max(0.001, duration);
+  const intensityPath = buildIntensityPath(
+    [...data.points].sort((left, right) => left.time - right.time),
+    1000 / safeDuration,
+    data.curve === "smooth",
+    data.effects
+      .filter((effect) => effect.type === "spline")
+      .map((effect) => ({
+        start: effect.start,
+        end: effect.start + effect.duration,
+      })),
+  );
+  const percentage = (time: number) =>
+    `${Math.min(100, Math.max(0, (time / safeDuration) * 100))}%`;
+
+  return (
+    <div
+      className="collapsedFixturePreview"
+      style={{ marginLeft: LABEL_WIDTH, width }}
+      aria-hidden="true"
+    >
+      {data.colors.map((clip) => (
+        <i
+          key={clip.id}
+          className="collapsedColorCue"
+          style={{
+            left: percentage(clip.start),
+            width: percentage(clip.duration),
+            background: clip.color,
+          }}
+        />
+      ))}
+      {data.colorTransitions.map((transition) => (
+        <i
+          key={transition.id}
+          className="collapsedColorCue collapsedTransitionCue"
+          style={{
+            left: percentage(transition.start),
+            width: percentage(transition.duration),
+            background: `linear-gradient(90deg, ${transition.fromColor}, ${transition.toColor})`,
+          }}
+        />
+      ))}
+      {data.strobes.map((clip) => (
+        <i
+          key={clip.id}
+          className="collapsedStrobeCue"
+          style={{
+            left: percentage(clip.start),
+            width: percentage(clip.duration),
+          }}
+        />
+      ))}
+      <svg viewBox="0 0 1000 150" preserveAspectRatio="none">
+        <path className="collapsedIntensityBackdrop" d={intensityPath} />
+        <path className="collapsedIntensityCurve" d={intensityPath} />
+      </svg>
+    </div>
+  );
+});
+
+function FixtureTrack({ fixture, data, zoom, grid, duration, width, selected, selection, previewMinimizedCues,
   beatTimes, onSelect, onSelection, onChange, onMoveFixture, onPan, onPreviewColorChange, selectedEffectKey, selectedColorKey, onSelectColorClip, onRequestColorTransition, onSelectEffect, onOpenItemContextMenu }: {
   fixture: PatchedFixture; data?: TrackData; zoom: number; grid: number; duration: number; width: number;
   beatTimes: number[];
+  previewMinimizedCues: boolean;
   selected: boolean; selection: Selection | null; onSelect: () => void;
-  onSelection: (selection: Selection | null) => void; onChange: (data: TrackData) => void;
+  onSelection: (selection: Selection | null) => void; onChange: (data: TrackData, mode?: TrackChangeMode) => void;
   onMoveFixture: (draggedId: string, targetId: string, placement: "before" | "after") => void; onPan: (delta: number) => void;
   onPreviewColorChange: (color: string | null) => void;
   selectedEffectKey: string | null;
@@ -3374,7 +3922,7 @@ function FixtureTrack({ fixture, data, zoom, grid, duration, width, selected, se
   if (!data) return null;
   return <section
     data-fixture-id={fixture.id}
-    className={`fixtureTrack ${selected ? "selectedTrack" : ""}`}
+    className={`fixtureTrack ${selected ? "selectedTrack" : ""} ${collapsed ? "trackCollapsed" : ""}`}
     onPointerDownCapture={onSelect}
   >
     <button className={`trackHeader ${reordering ? "isReordering" : ""}`}
@@ -3449,6 +3997,9 @@ function FixtureTrack({ fixture, data, zoom, grid, duration, width, selected, se
       </span>
       <span className="trackState">{selected ? "SELECTED" : ""}</span>
     </button>
+    {collapsed && previewMinimizedCues ? (
+      <CollapsedFixturePreview data={data} duration={duration} width={width} />
+    ) : null}
     {!collapsed && <div className="trackBody" style={{ marginLeft: LABEL_WIDTH, width }}>
       <CurveLane
         fixtureId={fixture.id}
@@ -3466,6 +4017,7 @@ function FixtureTrack({ fixture, data, zoom, grid, duration, width, selected, se
       />
       <div className="parameterDivider"><span>FIXTURE PARAMETERS</span></div>
       <ColorLane clips={data.colors} transitions={data.colorTransitions} zoom={zoom} grid={grid} duration={duration} width={width} beatTimes={beatTimes}
+        selection={selection}
         onChange={(colors, colorTransitions) => onChange({ ...data, colors, colorTransitions })}
         onPreviewColorChange={onPreviewColorChange}
         fixtureId={fixture.id}
@@ -3498,6 +4050,7 @@ function GroupedFixtureTrack({
   duration,
   width,
   beatTimes,
+  previewMinimizedCues,
   selected,
   selectedChildFixtureId,
   expanded,
@@ -3529,6 +4082,7 @@ function GroupedFixtureTrack({
   duration: number;
   width: number;
   beatTimes: number[];
+  previewMinimizedCues: boolean;
   selected: boolean;
   selectedChildFixtureId: string;
   expanded: boolean;
@@ -3547,8 +4101,8 @@ function GroupedFixtureTrack({
   onSelection: (selection: Selection | null) => void;
   onChildSelect: (fixtureId: string) => void;
   onChildSelection: (fixtureId: string, selection: Selection | null) => void;
-  onChange: (data: TrackData) => void;
-  onChildChange: (fixtureId: string, data: TrackData) => void;
+  onChange: (data: TrackData, mode?: TrackChangeMode) => void;
+  onChildChange: (fixtureId: string, data: TrackData, mode?: TrackChangeMode) => void;
   onMoveFixture: (draggedId: string, targetId: string, placement: "before" | "after") => void;
   onPan: (delta: number) => void;
 }) {
@@ -3587,6 +4141,7 @@ function GroupedFixtureTrack({
         />
         <div className="parameterDivider"><span>FIXTURE PARAMETERS</span></div>
         <ColorLane clips={data.colors} transitions={data.colorTransitions} zoom={zoom} grid={grid} duration={duration} width={width} beatTimes={beatTimes}
+          selection={selection}
           onChange={(colors, colorTransitions) => onChange({ ...data, colors, colorTransitions })}
           onPreviewColorChange={onPreviewColorChange}
           fixtureId={group.id}
@@ -3622,6 +4177,7 @@ function GroupedFixtureTrack({
               duration={duration}
               width={width}
               beatTimes={beatTimes}
+              previewMinimizedCues={previewMinimizedCues}
               selected={selectedChildFixtureId === fixture.id}
               selection={childSelections.find((item) => item.fixtureId === fixture.id) ?? null}
               onPreviewColorChange={onPreviewColorChange}
@@ -3633,7 +4189,7 @@ function GroupedFixtureTrack({
               onOpenItemContextMenu={onOpenItemContextMenu}
               onSelect={() => onChildSelect(fixture.id)}
               onSelection={(nextSelection) => onChildSelection(fixture.id, nextSelection)}
-              onChange={(nextData) => onChildChange(fixture.id, nextData)}
+              onChange={(nextData, mode) => onChildChange(fixture.id, nextData, mode)}
               onMoveFixture={onMoveFixture}
               onPan={onPan}
             />
@@ -3651,7 +4207,7 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
   selectedEffectKey: string | null;
   onSelectEffect: (fixtureId: string, effect: IntensityEffect) => void;
   onOpenItemContextMenu: (menu: ItemContextMenuState) => void;
-  onChange: (data: TrackData) => void; onPan: (delta: number) => void;
+  onChange: (data: TrackData, mode?: TrackChangeMode) => void; onPan: (delta: number) => void;
 }) {
   const svgRef = useRef<SVGSVGElement>(null);
   const gesture = useRef<{ x: number; y: number; moved: boolean } | null>(null);
@@ -3677,6 +4233,90 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
     .filter((effect): effect is SplineEffect => effect.type === "spline")
     .map((effect) => ({ start: effect.start, end: effect.start + effect.duration }));
   const path = buildIntensityPath(sorted, zoom, data.curve === "smooth", splineRegions);
+  const buildSegmentDragTrack = (
+    drag: NonNullable<typeof segmentDrag.current>,
+    clientX: number,
+    clientY: number,
+  ) => {
+    if (drag.orientation === "vertical") {
+      const previousTime = sorted[drag.leftIndex - 1]?.time ?? 0;
+      const nextTime = sorted[drag.rightIndex + 1]?.time ?? duration;
+      const nextPointTime = Math.min(
+        nextTime,
+        Math.max(
+          previousTime,
+          snap(drag.startTime + (clientX - drag.startX) / zoom, grid),
+        ),
+      );
+      return {
+        ...data,
+        points: data.points.map((item, index) =>
+          index === drag.leftIndex || index === drag.rightIndex
+            ? { ...item, time: nextPointTime }
+            : item,
+        ),
+      };
+    }
+
+    const bounds = svgRef.current?.getBoundingClientRect();
+    const laneHeight = Math.max(1, bounds?.height ?? 150);
+    const nextValue = Math.min(
+      1,
+      Math.max(0, drag.startValue - (clientY - drag.startY) / laneHeight),
+    );
+    return {
+      ...data,
+      points: data.points.map((item, index) =>
+        index === drag.leftIndex || index === drag.rightIndex
+          ? { ...item, value: nextValue }
+          : item,
+      ),
+    };
+  };
+  const findSegmentAtPointer = (clientX: number, clientY: number) => {
+    const bounds = svgRef.current?.getBoundingClientRect();
+    if (!bounds) return null;
+    const pointerTime = Math.min(
+      duration,
+      Math.max(0, (clientX - bounds.left) / zoom),
+    );
+    const pointerValue = Math.min(
+      1,
+      Math.max(0, 1 - (clientY - bounds.top) / bounds.height),
+    );
+    const horizontalSegment = sorted.slice(0, -1).find((left, index) => {
+      const right = sorted[index + 1];
+      return (
+        Math.abs(left.value - right.value) < 0.001 &&
+        pointerTime >= left.time &&
+        pointerTime <= right.time &&
+        Math.abs(pointerValue - left.value) * bounds.height <= 14
+      );
+    });
+    const verticalSegment = sorted.slice(0, -1).find((left, index) => {
+      const right = sorted[index + 1];
+      return (
+        Math.abs(left.time - right.time) < 0.001 &&
+        Math.abs(pointerTime - left.time) * zoom <= 14 &&
+        pointerValue >= Math.min(left.value, right.value) &&
+        pointerValue <= Math.max(left.value, right.value)
+      );
+    });
+    const segment = horizontalSegment ?? verticalSegment;
+    if (!segment) return null;
+    const sortedIndex = sorted.indexOf(segment);
+    const orientation = horizontalSegment ? "horizontal" : "vertical";
+    if (orientation === "vertical" && sortedIndex === 0) return null;
+    return {
+      orientation,
+      leftIndex: data.points.indexOf(segment),
+      rightIndex: data.points.indexOf(sorted[sortedIndex + 1]),
+      startX: clientX,
+      startY: clientY,
+      startTime: segment.time,
+      startValue: segment.value,
+    } satisfies NonNullable<typeof segmentDrag.current>;
+  };
   const toPoint = (clientX: number, clientY: number) => {
     const bounds = svgRef.current?.getBoundingClientRect();
     if (!bounds) return null;
@@ -3701,6 +4341,51 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
     if (!before || !after || before.time === after.time) return before?.value ?? 0;
     const amount = (time - before.time) / (after.time - before.time);
     return before.value + (after.value - before.value) * amount;
+  };
+  const buildWaypointDragTrack = (
+    index: number,
+    point: Point,
+    clientX: number,
+    clientY: number,
+    snapToNeighbors: boolean,
+  ) => {
+    const next = toPoint(clientX, clientY);
+    if (!next) return null;
+    if (activeSplineEffect && !isWithinActiveSpline(point.time)) return null;
+    const neighborValues = [sorted[index - 1], sorted[index + 1]]
+      .filter((neighbor): neighbor is Point => Boolean(neighbor))
+      .map((neighbor) => neighbor.value);
+    const snappedValue =
+      snapToNeighbors && neighborValues.length
+        ? neighborValues.reduce((closest, value) =>
+            Math.abs(value - next.value) < Math.abs(closest - next.value)
+              ? value
+              : closest,
+          )
+        : next.value;
+    const draggedTime = Math.max(
+      0,
+      Math.min(
+        duration,
+        next.time - (waypointDrag.current?.timeOffset ?? 0),
+      ),
+    );
+    const adjusted =
+      index === 0
+        ? { ...next, time: point.time, value: snappedValue }
+        : activeSplineEffect
+          ? {
+              ...next,
+              time: clampToActiveSpline(draggedTime),
+              value: snappedValue,
+            }
+          : { ...next, time: draggedTime, value: snappedValue };
+    return {
+      ...data,
+      points: data.points
+        .map((item) => (item === point ? adjusted : item))
+        .sort((a, b) => a.time - b.time),
+    };
   };
 
   return <div className="curveLane" style={{ width }}>
@@ -3743,53 +4428,12 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
     <svg ref={svgRef} className="curveSvg" width={width} height="150"
       onPointerDown={(event) => {
         if (event.ctrlKey || event.metaKey) {
-          const bounds = svgRef.current?.getBoundingClientRect();
-          if (bounds) {
-            const pointerTime = Math.min(
-              duration,
-              Math.max(0, (event.clientX - bounds.left) / zoom),
-            );
-            const pointerValue = Math.min(
-              1,
-              Math.max(0, 1 - (event.clientY - bounds.top) / bounds.height),
-            );
-            const horizontalSegment = sorted.slice(0, -1).find((left, index) => {
-              const right = sorted[index + 1];
-              return (
-                Math.abs(left.value - right.value) < 0.001 &&
-                pointerTime >= left.time &&
-                pointerTime <= right.time &&
-                Math.abs(pointerValue - left.value) * bounds.height <= 12
-              );
-            });
-            const verticalSegment = sorted.slice(0, -1).find((left, index) => {
-              const right = sorted[index + 1];
-              return (
-                Math.abs(left.time - right.time) < 0.001 &&
-                Math.abs(pointerTime - left.time) * zoom <= 12 &&
-                pointerValue >= Math.min(left.value, right.value) &&
-                pointerValue <= Math.max(left.value, right.value)
-              );
-            });
-            const segment = horizontalSegment ?? verticalSegment;
-            if (segment) {
-              const sortedIndex = sorted.indexOf(segment);
-              const orientation = horizontalSegment ? "horizontal" : "vertical";
-              if (!(orientation === "vertical" && sortedIndex === 0)) {
-                event.preventDefault();
-                segmentDrag.current = {
-                  orientation,
-                  leftIndex: data.points.indexOf(segment),
-                  rightIndex: data.points.indexOf(sorted[sortedIndex + 1]),
-                  startX: event.clientX,
-                  startY: event.clientY,
-                  startTime: segment.time,
-                  startValue: segment.value,
-                };
-                event.currentTarget.setPointerCapture(event.pointerId);
-                return;
-              }
-            }
+          const segment = findSegmentAtPointer(event.clientX, event.clientY);
+          if (segment) {
+            event.preventDefault();
+            segmentDrag.current = segment;
+            event.currentTarget.setPointerCapture(event.pointerId);
+            return;
           }
         }
         gesture.current = { x: event.clientX, y: event.clientY, moved: false };
@@ -3798,39 +4442,7 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
       onPointerMove={(event) => {
         const drag = segmentDrag.current;
         if (drag && event.currentTarget.hasPointerCapture(event.pointerId)) {
-          if (drag.orientation === "vertical") {
-            const nextTime = Math.min(
-              duration,
-              Math.max(
-                0,
-                snap(
-                  drag.startTime + (event.clientX - drag.startX) / zoom,
-                  grid,
-                ),
-              ),
-            );
-            onChange({
-              ...data,
-              points: data.points.map((item, index) =>
-                index === drag.leftIndex || index === drag.rightIndex
-                  ? { ...item, time: nextTime }
-                  : item,
-              ),
-            });
-          } else {
-            const nextValue = Math.min(
-              1,
-              Math.max(0, drag.startValue - (event.clientY - drag.startY) / 150),
-            );
-            onChange({
-              ...data,
-              points: data.points.map((item, index) =>
-                index === drag.leftIndex || index === drag.rightIndex
-                  ? { ...item, value: nextValue }
-                  : item,
-              ),
-            });
-          }
+          onChange(buildSegmentDragTrack(drag, event.clientX, event.clientY), "preview");
           return;
         }
         if (!gesture.current || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
@@ -3849,6 +4461,10 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
       }}
       onPointerUp={(event) => {
         if (segmentDrag.current) {
+          onChange(
+            buildSegmentDragTrack(segmentDrag.current, event.clientX, event.clientY),
+            "commit",
+          );
           segmentDrag.current = null;
           if (event.currentTarget.hasPointerCapture(event.pointerId)) {
             event.currentTarget.releasePointerCapture(event.pointerId);
@@ -3882,94 +4498,7 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
       </defs>
       <path className="curveArea" d={`${path} L ${(sorted[sorted.length - 1]?.time ?? 0) * zoom} 150 L 0 150 Z`} />
       <path className="curveBackdrop" d={path} />
-      <path
-        className="intensityPath"
-        d={path}
-        onPointerDown={(event) => {
-          if (!event.ctrlKey && !event.metaKey) return;
-          const point = toPoint(event.clientX, event.clientY);
-          if (!point) return;
-          const horizontalSegment = sorted.slice(0, -1).find((left, index) => {
-            const right = sorted[index + 1];
-            return (
-              Math.abs(left.value - right.value) < 0.001 &&
-              point.time >= left.time &&
-              point.time <= right.time
-            );
-          });
-          const verticalSegment = sorted.slice(0, -1).find((left, index) => {
-            const right = sorted[index + 1];
-            return (
-              Math.abs(left.time - right.time) < 0.001 &&
-              point.value >= Math.min(left.value, right.value) &&
-              point.value <= Math.max(left.value, right.value)
-            );
-          });
-          const segment = horizontalSegment ?? verticalSegment;
-          if (!segment) return;
-          const index = sorted.indexOf(segment);
-          const orientation = horizontalSegment ? "horizontal" : "vertical";
-          if (orientation === "vertical" && index === 0) return;
-          event.preventDefault();
-          event.stopPropagation();
-          segmentDrag.current = {
-            orientation,
-            leftIndex: data.points.indexOf(segment),
-            rightIndex: data.points.indexOf(sorted[index + 1]),
-            startX: event.clientX,
-            startY: event.clientY,
-            startTime: segment.time,
-            startValue: segment.value,
-          };
-          event.currentTarget.setPointerCapture(event.pointerId);
-        }}
-        onPointerMove={(event) => {
-          const drag = segmentDrag.current;
-          if (!drag || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
-          if (drag.orientation === "vertical") {
-            const nextTime = Math.min(
-              duration,
-              Math.max(
-                0,
-                snap(
-                  drag.startTime + (event.clientX - drag.startX) / zoom,
-                  grid,
-                ),
-              ),
-            );
-            onChange({
-              ...data,
-              points: data.points.map((item, index) =>
-                  index === drag.leftIndex || index === drag.rightIndex
-                    ? { ...item, time: nextTime }
-                    : item,
-                ),
-            });
-            return;
-          }
-          const nextValue = Math.min(
-            1,
-            Math.max(0, drag.startValue - (event.clientY - drag.startY) / 150),
-          );
-          onChange({
-            ...data,
-            points: data.points.map((item, index) =>
-              index === drag.leftIndex || index === drag.rightIndex
-                ? { ...item, value: nextValue }
-                : item,
-            ),
-          });
-        }}
-        onPointerUp={(event) => {
-          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-            event.currentTarget.releasePointerCapture(event.pointerId);
-          }
-          segmentDrag.current = null;
-        }}
-        onPointerCancel={() => {
-          segmentDrag.current = null;
-        }}
-      />
+      <path className="intensityPath" d={path} />
       {sorted.map((point, index) => <circle className="waypoint" key={index} cx={Math.max(7, point.time * zoom)} cy={(1 - point.value) * 150} r="6"
         onPointerDown={(event) => {
           event.stopPropagation();
@@ -3982,40 +4511,27 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
         }}
         onPointerMove={(event) => {
           if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
-          const next = toPoint(event.clientX, event.clientY);
-          if (!next) return;
-          if (activeSplineEffect && !isWithinActiveSpline(point.time)) return;
-          const neighborValues = [sorted[index - 1], sorted[index + 1]]
-            .filter((neighbor): neighbor is Point => Boolean(neighbor))
-            .map((neighbor) => neighbor.value);
-          const snappedValue =
-            (event.ctrlKey || event.metaKey) && neighborValues.length
-              ? neighborValues.reduce((closest, value) =>
-                  Math.abs(value - next.value) < Math.abs(closest - next.value)
-                    ? value
-                    : closest,
-                )
-              : next.value;
-          const draggedTime = Math.max(
-            0,
-            Math.min(
-              duration,
-              next.time - (waypointDrag.current?.timeOffset ?? 0),
-            ),
+          const nextTrack = buildWaypointDragTrack(
+            index,
+            point,
+            event.clientX,
+            event.clientY,
+            event.ctrlKey || event.metaKey,
           );
-          const adjusted =
-            index === 0
-              ? { ...next, time: point.time, value: snappedValue }
-              : activeSplineEffect
-                ? {
-                    ...next,
-                    time: clampToActiveSpline(draggedTime),
-                    value: snappedValue,
-                  }
-                : { ...next, time: draggedTime, value: snappedValue };
-          onChange({ ...data, points: data.points.map((item) => item === point ? adjusted : item).sort((a, b) => a.time - b.time) });
+          if (!nextTrack) return;
+          onChange(nextTrack, "preview");
         }}
         onPointerUp={(event) => {
+          const nextTrack = buildWaypointDragTrack(
+            index,
+            point,
+            event.clientX,
+            event.clientY,
+            event.ctrlKey || event.metaKey,
+          );
+          if (nextTrack) {
+            onChange(nextTrack, "commit");
+          }
           if (event.currentTarget.hasPointerCapture(event.pointerId)) {
             event.currentTarget.releasePointerCapture(event.pointerId);
           }
@@ -4028,11 +4544,12 @@ function CurveLane({ fixtureId, data, zoom, grid, duration, width, beatTimes, se
   </div>;
 }
 
-function ColorLane({ fixtureId, clips, transitions, zoom, grid, duration, width, beatTimes, onChange, onPreviewColorChange, selectedColorKey, onSelectColorClip, onRequestColorTransition, onOpenItemContextMenu }: {
+function ColorLane({ fixtureId, clips, transitions, zoom, grid, duration, width, beatTimes, selection, onChange, onPreviewColorChange, selectedColorKey, onSelectColorClip, onRequestColorTransition, onOpenItemContextMenu }: {
   fixtureId: string;
   clips: ColorClip[]; zoom: number; grid: number; duration: number; width: number;
   transitions: ColorTransition[];
   beatTimes: number[];
+  selection: Selection | null;
   onChange: (clips: ColorClip[], transitions: ColorTransition[]) => void;
   onPreviewColorChange: (color: string | null) => void;
   selectedColorKey: string | null;
@@ -4117,7 +4634,40 @@ function ColorLane({ fixtureId, clips, transitions, zoom, grid, duration, width,
   };
 
   return <>
-  <div className="parameterLane colorLane" style={{ width }}>
+  <div
+    className="parameterLane colorLane"
+    style={{ width }}
+    onContextMenu={(event) => {
+      if (
+        (event.target as HTMLElement).closest(
+          ".colorBlock, .colorTransitionBlock, .colorTransitionBoundary",
+        )
+      ) {
+        return;
+      }
+      const bounds = event.currentTarget.getBoundingClientRect();
+      const clickedTime = Math.min(
+        duration,
+        Math.max(0, (event.clientX - bounds.left) / zoom),
+      );
+      if (
+        selection &&
+        clickedTime >= Math.min(selection.start, selection.end) &&
+        clickedTime <= Math.max(selection.start, selection.end)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      onOpenItemContextMenu({
+        kind: "colorLane",
+        x: event.clientX,
+        y: event.clientY,
+        fixtureId,
+        time: clickedTime,
+      });
+    }}
+  >
     <LaneBeatLines beatTimes={beatTimes} zoom={zoom} />
     <span>COLOR</span>
     {clips.map((clip, index) => (
@@ -4292,17 +4842,37 @@ const ColorClipBlock = memo(function ColorClipBlock({
 }) {
   const blockRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const previewTimerRef = useRef<number | null>(null);
+  const previewFrameRef = useRef<number | null>(null);
   const pendingPreviewColorRef = useRef<string | null>(null);
+  const confirmingColorRef = useRef(false);
+  const [editingColor, setEditingColor] = useState(false);
 
   const flushPreviewColor = (color: string | null) => {
     pendingPreviewColorRef.current = color;
-    if (previewTimerRef.current !== null) return;
-    previewTimerRef.current = window.setTimeout(() => {
-      previewTimerRef.current = null;
+    if (previewFrameRef.current !== null) return;
+    previewFrameRef.current = window.requestAnimationFrame(() => {
+      previewFrameRef.current = null;
       onPreviewColorChange(pendingPreviewColorRef.current);
-    }, 75);
+    });
   };
+
+  const previewInputColor = (color: string) => {
+    if (blockRef.current) {
+      blockRef.current.style.background = color;
+    }
+    flushPreviewColor(color);
+  };
+
+  const resetUnconfirmedColor = () => {
+    if (inputRef.current) inputRef.current.value = clip.color;
+    if (blockRef.current) blockRef.current.style.background = clip.color;
+    setEditingColor(false);
+    flushPreviewColor(null);
+  };
+
+  useEffect(() => {
+    if (!selected) resetUnconfirmedColor();
+  }, [selected]);
 
   useEffect(() => {
     if (blockRef.current) {
@@ -4314,8 +4884,8 @@ const ColorClipBlock = memo(function ColorClipBlock({
   }, [clip.color]);
 
   useEffect(() => () => {
-    if (previewTimerRef.current !== null) {
-      window.clearTimeout(previewTimerRef.current);
+    if (previewFrameRef.current !== null) {
+      window.cancelAnimationFrame(previewFrameRef.current);
     }
   }, []);
 
@@ -4344,22 +4914,49 @@ const ColorClipBlock = memo(function ColorClipBlock({
         defaultValue={clip.color}
         onPointerDown={(event) => {
           event.stopPropagation();
+          onSelect();
+          setEditingColor(true);
           flushPreviewColor(inputRef.current?.value ?? clip.color);
         }}
-        onFocus={() => flushPreviewColor(inputRef.current?.value ?? clip.color)}
+        onFocus={() => {
+          setEditingColor(true);
+          flushPreviewColor(inputRef.current?.value ?? clip.color);
+        }}
         onInput={(event) => {
-          if (blockRef.current) {
-            blockRef.current.style.background = event.currentTarget.value;
-          }
-          flushPreviewColor(event.currentTarget.value);
+          previewInputColor(event.currentTarget.value);
         }}
         onChange={(event) => {
-          const nextColor = event.currentTarget.value;
-          flushPreviewColor(nextColor);
-          commit(clips.map((item) => item.id === clip.id ? { ...item, color: nextColor } : item));
+          previewInputColor(event.currentTarget.value);
         }}
-        onBlur={() => flushPreviewColor(null)}
+        onBlur={() => {
+          if (confirmingColorRef.current) return;
+          resetUnconfirmedColor();
+        }}
       />
+      {editingColor ? (
+        <button
+          type="button"
+          className="colorConfirmButton"
+          onPointerDown={(event) => {
+            event.stopPropagation();
+            confirmingColorRef.current = true;
+          }}
+          onClick={(event) => {
+            event.stopPropagation();
+            const nextColor = inputRef.current?.value ?? clip.color;
+            commit(
+              clips.map((item) =>
+                item.id === clip.id ? { ...item, color: nextColor } : item,
+              ),
+            );
+            flushPreviewColor(null);
+            setEditingColor(false);
+            confirmingColorRef.current = false;
+          }}
+        >
+          Confirm
+        </button>
+      ) : null}
       <b
         className="clipDragSurface"
         onPointerDown={(event) => {
@@ -4514,15 +5111,40 @@ function layoutBeatgridRegions(
   return { regions, rowCount: Math.max(1, rowEnds.length) };
 }
 
-function LaneBeatLines({ beatTimes, zoom }: { beatTimes: number[]; zoom: number }) {
+function getVisibleBeatTimes(beatTimes: number[], zoom: number) {
+  const minimumGapPx =
+    zoom <= 12 ? 96 :
+    zoom <= 18 ? 72 :
+    zoom <= 28 ? 48 :
+    zoom <= 40 ? 32 :
+    18;
+  const visible: Array<{ time: number; index: number }> = [];
+  let lastLeft = -Infinity;
+
+  beatTimes.forEach((time, index) => {
+    const left = time * zoom;
+    if (left - lastLeft < minimumGapPx) return;
+    visible.push({ time, index });
+    lastLeft = left;
+  });
+
+  return visible;
+}
+
+const LaneBeatLines = memo(function LaneBeatLines({ beatTimes, zoom }: { beatTimes: number[]; zoom: number }) {
+  const visibleBeatTimes = getVisibleBeatTimes(beatTimes, zoom);
   return (
     <div className="laneBeatLines">
-      {beatTimes.map((time, index) => (
-        <i key={`${time}-${index}`} style={{ left: time * zoom }} />
+      {visibleBeatTimes.map(({ time, index }) => (
+        <i
+          key={`${time}-${index}`}
+          className={index % 4 === 0 ? "majorBeatLine" : ""}
+          style={{ left: time * zoom }}
+        />
       ))}
     </div>
   );
-}
+});
 
 function BeatgridLane({
   points,
@@ -4541,6 +5163,7 @@ function BeatgridLane({
 }) {
   const sorted = [...points].sort((a, b) => a.time - b.time);
   const beats = getBeatTimes(points, duration);
+  const visibleBeats = getVisibleBeatTimes(beats, zoom);
   const { regions, rowCount } = layoutBeatgridRegions(points, zoom, duration);
   const laneHeight = 30 + rowCount * 26;
 
@@ -4553,8 +5176,12 @@ function BeatgridLane({
         <span>Enter BPM to apply</span>
       </div>
       <div className="beatLines">
-        {beats.map((time, index) => (
-          <i key={`${time}-${index}`} style={{ left: time * zoom }} />
+        {visibleBeats.map(({ time, index }) => (
+          <i
+            key={`${time}-${index}`}
+            className={index % 4 === 0 ? "majorBeatLine" : ""}
+            style={{ left: time * zoom }}
+          />
         ))}
       </div>
       {regions.map((point) => {
@@ -4806,15 +5433,37 @@ const Waveform = memo(function Waveform({
   playhead: number;
 }) {
   const renderWidth = Math.max(width, visibleWidth);
-  const points = useMemo(() => samples.map((sample, index) => {
-      const x = samples.length > 1 ? (index / (samples.length - 1)) * 1000 : 0;
-      const clamped = Math.min(1, Math.max(0, sample));
+  const normalizedScroll = Math.min(
+    Math.max(0, scroll),
+    Math.max(0, renderWidth - visibleWidth),
+  );
+  const points = useMemo(() => {
+    const targetCount = Math.min(
+      2200,
+      Math.max(240, Math.ceil(renderWidth / 2.2)),
+    );
+    const bucketCount = Math.min(samples.length, targetCount);
+    if (bucketCount <= 0) return [];
+
+    return Array.from({ length: bucketCount }, (_, index) => {
+      const start = Math.floor((index / bucketCount) * samples.length);
+      const end = Math.max(
+        start + 1,
+        Math.floor(((index + 1) / bucketCount) * samples.length),
+      );
+      let peak = 0;
+      for (let sampleIndex = start; sampleIndex < end; sampleIndex += 1) {
+        peak = Math.max(peak, samples[sampleIndex] ?? 0);
+      }
+      const x = bucketCount > 1 ? (index / (bucketCount - 1)) * 1000 : 0;
+      const clamped = Math.min(1, Math.max(0, peak));
       return {
         x,
         top: 50 - clamped * 45,
         bottom: 50 + clamped * 45,
       };
-    }), [samples]);
+    });
+  }, [samples, renderWidth]);
   const topEdge = points.map(({ x, top }) => `${x},${top}`).join(" ");
   const bottomEdge = [...points]
     .reverse()
@@ -4832,7 +5481,10 @@ const Waveform = memo(function Waveform({
     </div>
     <div className="waveformWindow">
       <div className="waveformWindowGlow" />
-      <div className="waveformBars" style={{ width: renderWidth, transform: `translateX(${-scroll}px)` }}>
+      <div
+        className="waveformBars"
+        style={{ width: renderWidth, transform: `translateX(${-normalizedScroll}px)` }}
+      >
         <svg
           viewBox="0 0 1000 100"
           preserveAspectRatio="none"
@@ -4859,11 +5511,6 @@ const Waveform = memo(function Waveform({
             <line key={`v-${x}`} className="waveformMinorGuide" x1={x * 1000} y1="0" x2={x * 1000} y2="100" />
           ))}
           <polygon className="waveformBody" points={`${topEdge} ${bottomEdge}`} />
-          <g className="waveformSampleBars">
-            {points.map(({ x, top, bottom }, index) => (
-              <line key={`sample-${index}`} x1={x} y1={top} x2={x} y2={bottom} />
-            ))}
-          </g>
           <polyline points={centerDetail} className="waveformCenterDetail" />
           <polyline points={topEdge} className="waveformRidge" />
           <polyline points={bottomEdge} className="waveformRidge waveformRidgeBottom" />

@@ -225,6 +225,8 @@ const RECENT_PROJECTS_STORAGE_KEY = "disaster.recentProjects.v1";
 const RECENT_AUDIO_STORAGE_KEY = "disaster.recentAudio.v1";
 const FONT_FAMILY_STORAGE_KEY = "disaster.fontFamily.v1";
 const VISUAL_EFFECTS_STORAGE_KEY = "disaster.visualEffects.v1";
+const MINIMIZED_CUE_PREVIEWS_STORAGE_KEY = "disaster.minimizedCuePreviews.v1";
+const STAGE_PLOT_ZOOM_STORAGE_KEY = "disaster.stagePlotZoom.v1";
 const WORKING_VERSION_SUFFIX = "*";
 const RECENT_FILES_DATABASE = "disaster-recent-files";
 const RECENT_FILES_STORE = "files";
@@ -414,6 +416,9 @@ function App() {
   const [visualEffectsEnabled, setVisualEffectsEnabled] = useState(
     () => localStorage.getItem(VISUAL_EFFECTS_STORAGE_KEY) !== "false",
   );
+  const [minimizedCuePreviewsEnabled, setMinimizedCuePreviewsEnabled] = useState(
+    () => localStorage.getItem(MINIMIZED_CUE_PREVIEWS_STORAGE_KEY) !== "false",
+  );
   const [ports, setPorts] = useState<SerialPortDto[]>([]);
   const [artNetNodes, setArtNetNodes] = useState<ArtNetNodeDto[]>([]);
   const [artNetEnabled, setArtNetEnabled] = useState(
@@ -428,6 +433,7 @@ function App() {
   const [channels, setChannels] = useState<number[]>(Array(512).fill(0));
   const [status, setStatus] = useState("Not connected");
   const latestChannelsRef = useRef<number[]>(Array(512).fill(0));
+  const lastChannelUiUpdateRef = useRef(0);
   const sendTimerRef = useRef<number | null>(null);
   const connectedRef = useRef(false);
   const connectedPortRef = useRef("");
@@ -1747,8 +1753,12 @@ function clearFixture(fixture: PatchedFixture) {
   ) {
     latestTimelineOutputRef.current = output;
     const next = buildFixtureChannels(output, previewColorRef.current);
-    setChannels(next);
     queueSend(next);
+    const now = performance.now();
+    if (now - lastChannelUiUpdateRef.current >= 50) {
+      lastChannelUiUpdateRef.current = now;
+      setChannels(next);
+    }
   }
 
   function handleColorPreviewChange(color: string | null) {
@@ -2169,6 +2179,24 @@ function clearFixture(fixture: PatchedFixture) {
                   const next = event.target.checked;
                   setVisualEffectsEnabled(next);
                   localStorage.setItem(VISUAL_EFFECTS_STORAGE_KEY, String(next));
+                }}
+              />
+            </label>
+            <label className="appAppearanceSetting appAppearanceToggle">
+              <span>
+                <strong>Preview cues on minimized fixtures</strong>
+                <small>Show compact intensity, color, transition, and strobe timelines</small>
+              </span>
+              <input
+                type="checkbox"
+                checked={minimizedCuePreviewsEnabled}
+                onChange={(event) => {
+                  const next = event.target.checked;
+                  setMinimizedCuePreviewsEnabled(next);
+                  localStorage.setItem(
+                    MINIMIZED_CUE_PREVIEWS_STORAGE_KEY,
+                    String(next),
+                  );
                 }}
               />
             </label>
@@ -2848,6 +2876,7 @@ function clearFixture(fixture: PatchedFixture) {
           volume={sharedVolume}
           onVolumeChange={setSharedVolume}
           onHistoryStateChange={updateActiveStageTimelineHistory}
+          previewMinimizedCues={minimizedCuePreviewsEnabled}
         />
       ) : (
         <StageView
@@ -2865,6 +2894,7 @@ function clearFixture(fixture: PatchedFixture) {
           volume={sharedVolume}
           onVolumeChange={setSharedVolume}
           onUpdatePlot2d={updateActiveStagePlot2d}
+          onBeforePlotChange={pushStageUndoSnapshot}
         />
       )}
     </div>
@@ -3054,6 +3084,7 @@ function StageView({
   volume,
   onVolumeChange,
   onUpdatePlot2d,
+  onBeforePlotChange,
 }: {
   mode: "hub" | "plot2d";
   onChangeMode: (mode: "hub" | "plot2d") => void;
@@ -3069,6 +3100,7 @@ function StageView({
   volume: number;
   onVolumeChange: (volume: number) => void;
   onUpdatePlot2d: (plot2d: StagePlotFixture[]) => void;
+  onBeforePlotChange: () => void;
 }) {
   const timeline = stage?.timeline ?? null;
   const duration = Math.max(10, timeline?.duration ?? 60);
@@ -3083,10 +3115,16 @@ function StageView({
   const [transportLockEnabled, setTransportLockEnabled] = useState(false);
   const [stopArmed, setStopArmed] = useState(false);
   const [plotGridSize, setPlotGridSize] = useState(8);
-  const [plotZoom, setPlotZoom] = useState(1);
+  const [plotZoom, setPlotZoom] = useState(() => {
+    const saved = Number(window.localStorage.getItem(STAGE_PLOT_ZOOM_STORAGE_KEY));
+    return Number.isFinite(saved) && saved >= 0.7 && saved <= 1.8 ? saved : 1;
+  });
   const [plotViewportOffset, setPlotViewportOffset] = useState({ x: 0, y: 0 });
   const [selectedFixtureForPlot, setSelectedFixtureForPlot] = useState(
     fixtures[0]?.id ?? "",
+  );
+  const [selectedFixtureIdsForPlot, setSelectedFixtureIdsForPlot] = useState<string[]>(
+    fixtures[0]?.id ? [fixtures[0].id] : [],
   );
   const plotViewportRef = useRef<HTMLDivElement>(null);
   const stageFrameRef = useRef<HTMLDivElement>(null);
@@ -3098,11 +3136,38 @@ function StageView({
     originY: number;
     moved: boolean;
   } | null>(null);
+  const plotSelectionRef = useRef<{
+    pointerId: number;
+    additive: boolean;
+    anchorX: number;
+    anchorY: number;
+  } | null>(null);
+  const fixtureDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    historyCaptured: boolean;
+  } | null>(null);
+  const [plotSelectionBox, setPlotSelectionBox] = useState<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  } | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const loadedStageAudioRef = useRef<string | null>(null);
   const previewOutput = getStagePreviewOutput(fixtures, timeline, playhead);
-  const selectedPlacedFixture =
-    plotFixtures.find((item) => item.fixtureId === selectedFixtureForPlot) ?? null;
+  const selectedPlacedFixtures = plotFixtures.filter((item) =>
+    selectedFixtureIdsForPlot.includes(item.fixtureId),
+  );
+  const selectedPlotDirection =
+    selectedPlacedFixtures.length === 0
+      ? ""
+      : selectedPlacedFixtures.every(
+            (fixture) => fixture.direction === selectedPlacedFixtures[0]?.direction,
+          )
+        ? (selectedPlacedFixtures[0]?.direction ?? "front")
+        : "";
   const stageGridRows = Math.max(4, plotGridSize);
   const stageGridColumns = Math.max(6, Math.round(plotGridSize * 1.5));
   const plotCanvasWidth = 1180;
@@ -3119,6 +3184,16 @@ function StageView({
       setSelectedFixtureForPlot(fixtures[0]?.id ?? "");
     }
   }, [fixtures, selectedFixtureForPlot]);
+
+  useEffect(() => {
+    setSelectedFixtureIdsForPlot((previous) => {
+      const filtered = previous.filter((fixtureId) =>
+        fixtures.some((fixture) => fixture.id === fixtureId),
+      );
+      if (filtered.length) return filtered;
+      return fixtures[0]?.id ? [fixtures[0].id] : [];
+    });
+  }, [fixtures]);
 
   useEffect(() => {
     if (!playing) return;
@@ -3255,13 +3330,70 @@ function StageView({
   }
 
   function updateFixtureDirection(
-    fixtureId: string,
+    fixtureIds: string[],
     direction: "front" | "back" | "left" | "right",
   ) {
+    const targetIds = new Set(fixtureIds);
     const next = plotFixtures.map((item) =>
-      item.fixtureId === fixtureId ? { ...item, direction } : item,
+      targetIds.has(item.fixtureId) ? { ...item, direction } : item,
     );
     onUpdatePlot2d(next);
+  }
+
+  function getStageSelectionFromClientPoints(
+    startClientX: number,
+    startClientY: number,
+    endClientX: number,
+    endClientY: number,
+  ) {
+    const bounds = stageFrameRef.current?.getBoundingClientRect();
+    const frame = stageFrameRef.current;
+    if (!bounds || !frame) return { fixtureIds: [], box: null };
+
+    const logicalWidth = frame.clientWidth;
+    const logicalHeight = frame.clientHeight;
+    const toLogicalX = (value: number) =>
+      ((value - bounds.left) / Math.max(1, bounds.width)) * logicalWidth;
+    const toLogicalY = (value: number) =>
+      ((value - bounds.top) / Math.max(1, bounds.height)) * logicalHeight;
+    const clampX = (value: number) =>
+      Math.min(logicalWidth, Math.max(0, toLogicalX(value)));
+    const clampY = (value: number) =>
+      Math.min(logicalHeight, Math.max(0, toLogicalY(value)));
+    const startX = clampX(startClientX);
+    const startY = clampY(startClientY);
+    const endX = clampX(endClientX);
+    const endY = clampY(endClientY);
+    const left = Math.min(startX, endX);
+    const right = Math.max(startX, endX);
+    const top = Math.min(startY, endY);
+    const bottom = Math.max(startY, endY);
+    const minimumSize = 6;
+    const fixtureIds = plotFixtures
+      .filter((fixture) => {
+        const fixtureX = fixture.x * logicalWidth;
+        const fixtureY = fixture.y * logicalHeight;
+        return (
+          fixtureX >= left &&
+          fixtureX <= right &&
+          fixtureY >= top &&
+          fixtureY <= bottom
+        );
+      })
+      .map((fixture) => fixture.fixtureId);
+
+    return {
+      fixtureIds,
+      box:
+        Math.abs(right - left) >= minimumSize || Math.abs(bottom - top) >= minimumSize
+          ? {
+              left,
+              top,
+              width: Math.max(minimumSize, right - left),
+              height: Math.max(minimumSize, bottom - top),
+            }
+          : null,
+    };
   }
 
   function placeFixtureAtClientPosition(
@@ -3452,7 +3584,11 @@ function StageView({
               max="1.8"
               step="0.05"
               value={plotZoom}
-              onChange={(event) => setPlotZoom(Number(event.target.value))}
+              onChange={(event) => {
+                const nextZoom = Number(event.target.value);
+                setPlotZoom(nextZoom);
+                window.localStorage.setItem(STAGE_PLOT_ZOOM_STORAGE_KEY, String(nextZoom));
+              }}
             />
             <span>{Math.round(plotZoom * 100)}%</span>
           </label>
@@ -3478,8 +3614,11 @@ function StageView({
               return (
                 <button
                   key={fixture.id}
-                  className={`stageFixtureChip ${selectedFixtureForPlot === fixture.id ? "selected" : ""}`}
-                  onClick={() => setSelectedFixtureForPlot(fixture.id)}
+                  className={`stageFixtureChip ${selectedFixtureIdsForPlot.includes(fixture.id) ? "selected" : ""}`}
+                  onClick={() => {
+                    setSelectedFixtureForPlot(fixture.id);
+                    setSelectedFixtureIdsForPlot([fixture.id]);
+                  }}
                   style={{
                     borderColor: state.color ?? "#313944",
                     boxShadow: state.strobe ? "0 0 0 1px rgba(255,255,255,.18), 0 0 16px rgba(255,255,255,.1)" : undefined,
@@ -3495,15 +3634,21 @@ function StageView({
             <label>
               Rotation / projection direction
               <select
-                value={selectedPlacedFixture?.direction ?? "front"}
-                disabled={!selectedPlacedFixture}
+                value={selectedPlotDirection}
+                disabled={!selectedPlacedFixtures.length}
                 onChange={(event) =>
-                  updateFixtureDirection(
-                    selectedFixtureForPlot,
-                    event.target.value as "front" | "back" | "left" | "right",
-                  )
+                  {
+                    onBeforePlotChange();
+                    updateFixtureDirection(
+                      selectedPlacedFixtures.map((fixture) => fixture.fixtureId),
+                      event.target.value as "front" | "back" | "left" | "right",
+                    );
+                  }
                 }
               >
+                <option value="" disabled>
+                  Mixed
+                </option>
                 <option value="front">Front</option>
                 <option value="back">Back</option>
                 <option value="left">Left</option>
@@ -3511,9 +3656,9 @@ function StageView({
               </select>
             </label>
             <small>
-              {selectedPlacedFixture
-                ? "Controls the direction of the selected fixture's cone."
-                : "Place the selected fixture on the stage to set its cone direction."}
+              {selectedPlacedFixtures.length
+                ? `Controls the direction of ${selectedPlacedFixtures.length === 1 ? "the selected fixture's cone." : "all selected fixtures' cones."}`
+                : "Place and select fixtures on the stage to set their cone direction."}
             </small>
           </div>
         </aside>
@@ -3526,6 +3671,25 @@ function StageView({
             onPointerDown={(event) => {
               const target = event.target as HTMLElement;
               if (target.closest(".stageFixtureBlock")) return;
+              if ((event.ctrlKey || event.metaKey) && stageFrameRef.current) {
+                const selection = getStageSelectionFromClientPoints(
+                  event.clientX,
+                  event.clientY,
+                  event.clientX,
+                  event.clientY,
+                );
+                plotSelectionRef.current = {
+                  pointerId: event.pointerId,
+                  additive: true,
+                  anchorX: event.clientX,
+                  anchorY: event.clientY,
+                };
+                setPlotSelectionBox(selection.box);
+                event.currentTarget.setPointerCapture(event.pointerId);
+                event.preventDefault();
+                return;
+              }
+              setSelectedFixtureIdsForPlot([]);
               plotPanRef.current = {
                 pointerId: event.pointerId,
                 startX: event.clientX,
@@ -3537,6 +3701,21 @@ function StageView({
               event.currentTarget.setPointerCapture(event.pointerId);
             }}
             onPointerMove={(event) => {
+              const selection = plotSelectionRef.current;
+              if (
+                selection &&
+                selection.pointerId === event.pointerId &&
+                event.currentTarget.hasPointerCapture(event.pointerId)
+              ) {
+                const nextSelection = getStageSelectionFromClientPoints(
+                  selection.anchorX,
+                  selection.anchorY,
+                  event.clientX,
+                  event.clientY,
+                );
+                setPlotSelectionBox(nextSelection.box);
+                return;
+              }
               const pan = plotPanRef.current;
               if (!pan || pan.pointerId !== event.pointerId || !event.currentTarget.hasPointerCapture(event.pointerId)) {
                 return;
@@ -3554,12 +3733,36 @@ function StageView({
               );
             }}
             onPointerUp={(event) => {
+              const selection = plotSelectionRef.current;
+              if (
+                selection &&
+                selection.pointerId === event.pointerId &&
+                event.currentTarget.hasPointerCapture(event.pointerId)
+              ) {
+                const nextSelection = getStageSelectionFromClientPoints(
+                  selection.anchorX,
+                  selection.anchorY,
+                  event.clientX,
+                  event.clientY,
+                );
+                if (nextSelection.fixtureIds.length) {
+                  setSelectedFixtureIdsForPlot((previous) =>
+                    Array.from(new Set([...previous, ...nextSelection.fixtureIds])),
+                  );
+                  setSelectedFixtureForPlot(nextSelection.fixtureIds[0] ?? selectedFixtureForPlot);
+                }
+                setPlotSelectionBox(null);
+                plotSelectionRef.current = null;
+                event.currentTarget.releasePointerCapture(event.pointerId);
+                return;
+              }
               const pan = plotPanRef.current;
               if (
                 pan &&
                 pan.pointerId === event.pointerId &&
                 !pan.moved &&
-                selectedFixtureForPlot
+                selectedFixtureForPlot &&
+                !plotFixtures.some((fixture) => fixture.fixtureId === selectedFixtureForPlot)
               ) {
                 const bounds = stageFrameRef.current?.getBoundingClientRect();
                 if (
@@ -3569,6 +3772,7 @@ function StageView({
                   event.clientY >= bounds.top &&
                   event.clientY <= bounds.bottom
                 ) {
+                  onBeforePlotChange();
                   placeFixtureAtClientPosition(
                     selectedFixtureForPlot,
                     event.clientX,
@@ -3585,6 +3789,8 @@ function StageView({
               if (event.currentTarget.hasPointerCapture(event.pointerId)) {
                 event.currentTarget.releasePointerCapture(event.pointerId);
               }
+              setPlotSelectionBox(null);
+              plotSelectionRef.current = null;
               plotPanRef.current = null;
             }}
           >
@@ -3610,6 +3816,17 @@ function StageView({
                 <span className="stageDirectionLabel stageDirectionBack">BACK</span>
                 <span className="stageDirectionLabel stageDirectionLeft">LEFT</span>
                 <span className="stageDirectionLabel stageDirectionRight">RIGHT</span>
+                {plotSelectionBox ? (
+                  <div
+                    className="stageFixtureSelectionBox"
+                    style={{
+                      left: `${plotSelectionBox.left}px`,
+                      top: `${plotSelectionBox.top}px`,
+                      width: `${plotSelectionBox.width}px`,
+                      height: `${plotSelectionBox.height}px`,
+                    }}
+                  />
+                ) : null}
                 {plotFixtures.map((placed) => {
                   const fixture = fixtures.find((item) => item.id === placed.fixtureId);
                   if (!fixture) return null;
@@ -3623,22 +3840,56 @@ function StageView({
                   return (
                     <button
                       key={fixture.id}
-                      className={`stageFixtureBlock ${state.strobe ? "isStrobing" : ""}`}
+                      className={`stageFixtureBlock ${selectedFixtureIdsForPlot.includes(fixture.id) ? "selected" : ""} ${state.strobe ? "isStrobing" : ""}`}
                       onPointerDown={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
                         setSelectedFixtureForPlot(fixture.id);
+                        setSelectedFixtureIdsForPlot((previous) =>
+                          event.ctrlKey || event.metaKey
+                            ? previous.includes(fixture.id)
+                              ? previous.filter((id) => id !== fixture.id)
+                              : [...previous, fixture.id]
+                            : [fixture.id],
+                        );
+                        fixtureDragRef.current = {
+                          pointerId: event.pointerId,
+                          startX: event.clientX,
+                          startY: event.clientY,
+                          historyCaptured: false,
+                        };
                         const target = event.currentTarget;
                         target.setPointerCapture(event.pointerId);
                       }}
                       onPointerMove={(event) => {
                         if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
+                        const drag = fixtureDragRef.current;
+                        if (
+                          drag &&
+                          drag.pointerId === event.pointerId &&
+                          !drag.historyCaptured &&
+                          Math.hypot(
+                            event.clientX - drag.startX,
+                            event.clientY - drag.startY,
+                          ) > 2
+                        ) {
+                          onBeforePlotChange();
+                          drag.historyCaptured = true;
+                        }
+                        if (!drag?.historyCaptured) return;
                         placeFixtureAtClientPosition(fixture.id, event.clientX, event.clientY);
                       }}
                       onPointerUp={(event) => {
                         if (event.currentTarget.hasPointerCapture(event.pointerId)) {
                           event.currentTarget.releasePointerCapture(event.pointerId);
                         }
+                        fixtureDragRef.current = null;
+                      }}
+                      onPointerCancel={(event) => {
+                        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                          event.currentTarget.releasePointerCapture(event.pointerId);
+                        }
+                        fixtureDragRef.current = null;
                       }}
                       style={{
                         left: `${placed.x * 100}%`,
