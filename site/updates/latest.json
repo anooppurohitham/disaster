@@ -1,0 +1,17 @@
+{
+  "version": "3.0.1",
+  "pub_date": "2026-08-16T10:00:08.435Z",
+  "notes": "## Recent changes\n\n- Added conversational context to Smart Cue follow-up requests.\n- Improved waypoint and intensity-bar dragging performance.\n- Allowed the first waypoint to move vertically while remaining locked at time zero.",
+  "platforms": {
+    "darwin-aarch64": {
+      "url": "https://github.com/anooppurohitham/disaster/releases/download/v3.0.1/Disaster.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTUm0yYWJiSU5KQlFYSUxiTllzdjU5Unk2QXJxckxvNGdReU1ubS9wdHdDbFpWR1J2Wjd6SVBzdnBCaW5HYWZPSVFpNEU3UzVUV1pNbnlTSy8wc0YvSURHeEVqenRid0FzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2ODc0MDkyCWZpbGU6RGlzYXN0ZXIuYXBwLnRhci5negpaZlFxUmUrcVc1NnY4MUlNc09qNU9YaW9EYVdhdC9ERlNmdW9HTzdLKzlYNDl5Vnd2bTVHYTVQUTlscTExYnhFZTErZlA0SU1HT2hEaUUzVTRGL0dDUT09Cg==",
+      "size": 6016934
+    },
+    "windows-x86_64": {
+      "url": "https://github.com/anooppurohitham/disaster/releases/download/v3.0.1/Disaster_3.0.1_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTUm0yYWJiSU5KQlNhR21VOVVPRVJRZ2tUbG0vMitYZTdJWjloS241NE5kejNjUmNRaE92QmJPTEJERDhVY1gyZlp0TkhYeWVHSkVrRlA0OXFjSWV5RUVhRHczNUVIL1FNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2ODc0MzcyCWZpbGU6RGlzYXN0ZXJfMy4wLjFfeDY0LXNldHVwLmV4ZQpGeHM0N1FETU1leXMvSkZWaERaWWtaZlNXYjNwQjVLbEJNT1lBM3NhREpsSnBteEJnblhCcGpkMnJUU1phV2g0MUpUcEg2T3FLU3lWVWQ0Q3JhazdCZz09Cg==",
+      "size": 3953723
+    }
+  }
+}
